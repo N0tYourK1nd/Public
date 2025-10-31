@@ -4,6 +4,7 @@ BASE_IMAGE="docker.io/kalilinux/kali-rolling:latest"
 GOLDEN_NAME="kali-golden"
 GOLDEN_IMAGE="kali-golden:latest"
 LOG_DIR="$HOME/.kali-pentest/logs"
+MOUNT_DIR="/mnt/container"
 
 # Create log directory if it doesn't exist
 mkdir -p "$LOG_DIR"
@@ -28,6 +29,7 @@ Golden Image Management:
   commit                  - Snapshot changes in golden container to golden image
   update-base             - Pull latest upstream Kali image
   recreate-golden         - Destroy golden container and recreate from base image
+  restore-golden          - Recreate golden container from existing golden image
 
 Container Inspection:
   list                    - List all containers (running and stopped)
@@ -44,14 +46,14 @@ Batch Operations:
   cleanup-golden          - Remove old golden image versions
 
 Utilities:
-  clone [name] [new_name]         - Clone an existing container to a new one
-  rename [old] [new]              - Rename a container
+  clone [name] [new_name]       - Clone an existing container to a new one
+  rename [old] [new]            - Rename a container
   export-container [name] [path]  - Export container as tar (supports gzip)
   import-image [tar_path] [name]  - Import container from tar (supports gzip)
-  mount [name]                    - Mount container filesystem for inspection
-  umount [name]                   - Unmount container filesystem
-  list-images                     - List all local images
-  remove-image [image]            - Remove a local image
+  mount [name]                  - Mount container filesystem for inspection
+  umount [name]                - Unmount container filesystem
+  list-images                   - List all local images
+  remove-image [image]          - Remove a local image
 
 Help:
   help                         - Show this help message
@@ -84,32 +86,29 @@ check_image_exists() {
 
 create_container() {
   local name=$1
-  if [ -z "$name" ]; then
-    echo "Error: Container name required"
-    exit 1
-  fi
+  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  podman container exists "$name" && { echo "Error: Container '$name' already exists"; exit 1; }
+  check_image_exists "$GOLDEN_IMAGE" || exit 1
   
-  if podman container exists "$name"; then
-    echo "Error: Container '$name' already exists"
-    exit 1
-  fi
-  
-  if ! check_image_exists "$GOLDEN_IMAGE"; then
-    echo "Error: Golden image '$GOLDEN_IMAGE' not found. Run: $0 commit"
-    exit 1
-  fi
+  sudo mkdir -p "$MOUNT_DIR/$name"
   
   podman run -d --name "$name" \
+    --userns=keep-id \
     -e DISPLAY=$DISPLAY \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
     --device /dev/dri \
     --security-opt label=disable \
     --ipc=host \
+    -v "$MOUNT_DIR/$name:/mnt/share" \
     "$GOLDEN_IMAGE" tail -f /dev/null
-  
+
+    
   log_action "Created container: $name"
-  echo "✓ Container '$name' created from '$GOLDEN_IMAGE'"
+  echo "✓ Container '$name' created"
+  echo "  Bidirectional sync: $MOUNT_DIR/$name ↔ /mnt/share"
 }
+
+
 
 start_container() {
   local name=$1
@@ -135,7 +134,7 @@ connect_container() {
   check_container_exists "$name" || exit 1
   
   log_action "Connected to container: $name"
-  podman exec -it "$name" bash
+  podman exec -it --user root "$name" bash
 }
 
 exec_command() {
@@ -149,7 +148,7 @@ exec_command() {
   check_container_exists "$name" || exit 1
   
   log_action "Executed command in $name: $*"
-  podman exec -it "$name" "$@"
+  podman exec -it --user root "$name" "$@"
 }
 
 delete_container() {
@@ -237,20 +236,52 @@ unpause_container() {
 golden_shell() {
   if ! podman container exists "$GOLDEN_NAME"; then
     echo "Golden container does not exist. Creating from '$BASE_IMAGE'..."
+    mkdir -p "$MOUNT_DIR/$GOLDEN_NAME"
     podman run -dit --name "$GOLDEN_NAME" \
+      --userns=keep-id \
       -e DISPLAY=$DISPLAY \
       -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
       --device /dev/dri \
       --security-opt label=disable \
       --ipc=host \
+      -v "$MOUNT_DIR/$GOLDEN_NAME:/mnt/share" \
       "$BASE_IMAGE" bash
+
     log_action "Created golden container: $GOLDEN_NAME"
     echo "✓ Golden container '$GOLDEN_NAME' created"
   fi
   
   log_action "Entered golden shell"
-  podman exec -it "$GOLDEN_NAME" bash
+  podman exec -it --user root "$GOLDEN_NAME" bash
 }
+
+
+restore-golden() {
+  if ! check_image_exists "$GOLDEN_IMAGE"; then
+    echo "Error: Golden image '$GOLDEN_IMAGE' not found"
+    exit 1
+  fi
+  
+  mkdir -p "$MOUNT_DIR/$GOLDEN_NAME"
+  
+  echo "Restoring golden container from existing image '$GOLDEN_IMAGE'..."
+  podman run -dit --replace --name "$GOLDEN_NAME" \
+    --userns=keep-id \
+    -e DISPLAY=$DISPLAY \
+    -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    --device /dev/dri \
+    --security-opt label=disable \
+    --ipc=host \
+    -v "$MOUNT_DIR/$GOLDEN_NAME:/mnt/share" \
+    "$GOLDEN_IMAGE" bash
+
+  
+  log_action "Restored golden container from existing image: $GOLDEN_IMAGE"
+  echo "✓ Golden container '$GOLDEN_NAME' restored"
+}
+
+
+
 
 commit_golden() {
   if ! check_container_exists "$GOLDEN_NAME"; then
@@ -285,16 +316,21 @@ recreate_golden() {
     log_action "Deleted golden container"
   fi
   
+  mkdir -p "$MOUNT_DIR/$GOLDEN_NAME"
   podman run -dit --name "$GOLDEN_NAME" \
+    --userns=keep-id \
     -e DISPLAY=$DISPLAY \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
     --device /dev/dri \
     --security-opt label=disable \
     --ipc=host \
+    -v "$MOUNT_DIR/$GOLDEN_NAME:/mnt/share" \
     "$BASE_IMAGE" bash
+
   
   log_action "Recreated golden container from base image"
   echo "✓ Golden container recreated from '$BASE_IMAGE'"
+  echo "  Files sync: $MOUNT_DIR/$GOLDEN_NAME ↔ /mnt/share"
 }
 
 list_containers() {
@@ -658,6 +694,9 @@ case $1 in
     ;;
   umount)
     umount_container "$2"
+    ;;
+  restore-golden)
+    restore-golden
     ;;
   version)
     version
