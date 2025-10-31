@@ -84,6 +84,12 @@ check_image_exists() {
   return 0
 }
 
+ensure_xauth() {
+  if [ ! -f "$HOME/.Xauthority" ] || [ ! -s "$HOME/.Xauthority" ]; then
+    xauth add $DISPLAY . $(mcookie)
+  fi
+}
+
 create_container() {
   local name=$1
   [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
@@ -96,17 +102,18 @@ create_container() {
     --userns=keep-id \
     -e DISPLAY=$DISPLAY \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    -v $HOME/.Xauthority:/root/.Xauthority:ro \
     --device /dev/dri \
     --security-opt label=disable \
     --ipc=host \
     -v "$MOUNT_DIR/$name:/mnt/share" \
     "$GOLDEN_IMAGE" tail -f /dev/null
 
-    
   log_action "Created container: $name"
   echo "✓ Container '$name' created"
   echo "  Bidirectional sync: $MOUNT_DIR/$name ↔ /mnt/share"
 }
+
 
 
 
@@ -241,6 +248,7 @@ golden_shell() {
       --userns=keep-id \
       -e DISPLAY=$DISPLAY \
       -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+      -v $HOME/.Xauthority:/root/.Xauthority:ro \
       --device /dev/dri \
       --security-opt label=disable \
       --ipc=host \
@@ -269,6 +277,7 @@ restore-golden() {
     --userns=keep-id \
     -e DISPLAY=$DISPLAY \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    -v $HOME/.Xauthority:/root/.Xauthority:ro \
     --device /dev/dri \
     --security-opt label=disable \
     --ipc=host \
