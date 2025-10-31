@@ -102,12 +102,13 @@ create_container() {
     --userns=keep-id \
     -e DISPLAY=$DISPLAY \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-    -v $HOME/.Xauthority:/root/.Xauthority:ro \
     --device /dev/dri \
     --security-opt label=disable \
     --ipc=host \
     -v "$MOUNT_DIR/$name:/mnt/share" \
     "$GOLDEN_IMAGE" tail -f /dev/null
+
+    #-v $HOME/.Xauthority:/root/.Xauthority:rw \
 
   log_action "Created container: $name"
   echo "✓ Container '$name' created"
@@ -244,16 +245,17 @@ golden_shell() {
   if ! podman container exists "$GOLDEN_NAME"; then
     echo "Golden container does not exist. Creating from '$BASE_IMAGE'..."
     mkdir -p "$MOUNT_DIR/$GOLDEN_NAME"
-    podman run -dit --name "$GOLDEN_NAME" \
+    podman run -d --name "$name" \
       --userns=keep-id \
       -e DISPLAY=$DISPLAY \
       -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-      -v $HOME/.Xauthority:/root/.Xauthority:ro \
       --device /dev/dri \
       --security-opt label=disable \
       --ipc=host \
-      -v "$MOUNT_DIR/$GOLDEN_NAME:/mnt/share" \
-      "$BASE_IMAGE" bash
+      -v "$MOUNT_DIR/$name:/mnt/share" \
+      "$GOLDEN_IMAGE" tail -f /dev/null
+
+      #-v $HOME/.Xauthority:/root/.Xauthority:rw \
 
     log_action "Created golden container: $GOLDEN_NAME"
     echo "✓ Golden container '$GOLDEN_NAME' created"
@@ -277,12 +279,12 @@ restore-golden() {
     --userns=keep-id \
     -e DISPLAY=$DISPLAY \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-    -v $HOME/.Xauthority:/root/.Xauthority:ro \
     --device /dev/dri \
     --security-opt label=disable \
     --ipc=host \
     -v "$MOUNT_DIR/$GOLDEN_NAME:/mnt/share" \
     "$GOLDEN_IMAGE" bash
+    #-v $HOME/.Xauthority:/root/.Xauthority:rw \
 
   
   log_action "Restored golden container from existing image: $GOLDEN_IMAGE"
