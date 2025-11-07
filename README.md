@@ -1,2 +1,2 @@
 # Public
-Misc stuff like setups, bin/exes
+Misc stuff: Setups, Scripts and other stuff
