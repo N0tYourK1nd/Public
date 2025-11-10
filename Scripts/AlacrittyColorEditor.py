@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+
 """
-Alacritty Color Editor & Theming Tool
+
+Alacritty Color Editor & Theming Tool with Pywal Integration
+
 """
 
 import tkinter as tk
@@ -60,6 +63,82 @@ class ColorTheory:
         h = (h + hue_shift) % 1.0
         r, g, b = ColorTheory.hsv_to_rgb(h, s, v)
         return ColorTheory.rgb_to_hex(r, g, b)
+
+
+class PywalCacheReader:
+    """Read and parse pywal cache files"""
+
+    @staticmethod
+    def get_cache_dir():
+        """Get pywal cache directory"""
+        return Path.home() / ".cache" / "wal"
+
+    @staticmethod
+    def cache_exists():
+        """Check if pywal cache exists"""
+        cache_dir = PywalCacheReader.get_cache_dir()
+        colors_json = cache_dir / "colors.json"
+        return colors_json.exists()
+
+    @staticmethod
+    def load_current_scheme():
+        """Load current pywal color scheme"""
+        cache_dir = PywalCacheReader.get_cache_dir()
+        colors_json = cache_dir / "colors.json"
+
+        if not colors_json.exists():
+            return None
+
+        with open(colors_json, 'r') as f:
+            data = json.load(f)
+
+        return data
+
+    @staticmethod
+    def get_wallpaper_path():
+        """Get current wallpaper path from pywal"""
+        cache_dir = PywalCacheReader.get_cache_dir()
+        wal_file = cache_dir / "wal"
+
+        if wal_file.exists():
+            with open(wal_file, 'r') as f:
+                return f.read().strip()
+        return None
+
+    @staticmethod
+    def convert_to_alacritty_format(pywal_data):
+        """Convert pywal color scheme to Alacritty format"""
+        colors = pywal_data.get('colors', {})
+        special = pywal_data.get('special', {})
+
+        # Map pywal colors to Alacritty
+        alacritty_colors = {
+            'primary.background': special.get('background', '#000000'),
+            'primary.foreground': special.get('foreground', '#ffffff'),
+            'cursor.text': special.get('background', '#000000'),
+            'cursor.cursor': special.get('cursor', special.get('foreground', '#ffffff')),
+            'selection.text': special.get('foreground', '#ffffff'),
+            'selection.background': colors.get('color8', '#555555'),
+            'normal.black': colors.get('color0', '#000000'),
+            'normal.red': colors.get('color1', '#ff0000'),
+            'normal.green': colors.get('color2', '#00ff00'),
+            'normal.yellow': colors.get('color3', '#ffff00'),
+            'normal.blue': colors.get('color4', '#0000ff'),
+            'normal.magenta': colors.get('color5', '#ff00ff'),
+            'normal.cyan': colors.get('color6', '#00ffff'),
+            'normal.white': colors.get('color7', '#ffffff'),
+            'bright.black': colors.get('color8', '#555555'),
+            'bright.red': colors.get('color9', '#ff5555'),
+            'bright.green': colors.get('color10', '#55ff55'),
+            'bright.yellow': colors.get('color11', '#ffff55'),
+            'bright.blue': colors.get('color12', '#5555ff'),
+            'bright.magenta': colors.get('color13', '#ff55ff'),
+            'bright.cyan': colors.get('color14', '#55ffff'),
+            'bright.white': colors.get('color15', '#ffffff'),
+        }
+
+        return alacritty_colors
+
 
 class ImagePaletteExtractor:
     """Extract dominant colors from images"""
@@ -236,6 +315,12 @@ class AlacrittyColorEditor:
         notebook.add(tab4, text="Sync Configs")
         self.setup_sync_tab(tab4)
 
+
+        # Pywal Cache Tab
+        tab_pywal = ttk.Frame(notebook)
+        notebook.add(tab_pywal, text="Pywal Cache")
+        self.setup_pywal_tab(tab_pywal)
+
         tab5 = ttk.Frame(notebook)
         notebook.add(tab5, text="History")
         self.setup_history_tab(tab5)
@@ -350,11 +435,11 @@ class AlacrittyColorEditor:
                     )
 
                     self.palette_canvas.create_text(
-                        rect_x + 30, rect_y + 45, text=color, anchor="n", 
+                        rect_x + 30, rect_y + 45, text=color, anchor="n",
                         font=("", 7), tags=tag
                     )
 
-        self.palette_canvas.tag_bind(f"scheme_{scheme_idx}", "<Button-1>", 
+        self.palette_canvas.tag_bind(f"scheme_{scheme_idx}", "<Button-1>",
                                      lambda e, idx=scheme_idx: self.apply_palette(idx))
 
     def on_palette_click(self, event):
@@ -478,10 +563,10 @@ class AlacrittyColorEditor:
 
             ttk.Label(btn_frame, text="📄 rofi config", width=20, font=("", 10)).pack(side="left")
             ttk.Label(btn_frame, text=str(rofi_path), foreground="gray").pack(side="left", padx=20)
-            ttk.Button(btn_frame, text="Sync Colors →", 
+            ttk.Button(btn_frame, text="Sync Colors →",
                       command=lambda: self.sync_rofi_safely(rofi_path)).pack(side="right", padx=5)
         else:
-            ttk.Label(info_frame, text="No rofi config found at ~/.config/rofi/config.rasi", 
+            ttk.Label(info_frame, text="No rofi config found at ~/.config/rofi/config.rasi",
                      foreground="orange").pack(pady=20)
 
     def sync_rofi_safely(self, rofi_path):
@@ -494,6 +579,205 @@ class AlacrittyColorEditor:
             messagebox.showinfo("Success", f"Rofi config synced!\nColors appended at bottom.\nBackup: {backup_path}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to sync rofi: {e}")
+
+    def setup_pywal_tab(self, tab):
+        """Setup pywal cache browser tab"""
+        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        # Header
+        header = ttk.Frame(tab)
+        header.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+
+        ttk.Label(header, text="Pywal Cache Browser", font=("", 12, "bold")).pack(side="left")
+        ttk.Button(header, text="🔄 Refresh", command=self.refresh_pywal_cache).pack(side="right", padx=5)
+
+        # Main content frame
+        content = ttk.Frame(tab)
+        content.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_columnconfigure(0, weight=1)
+
+        # Check if pywal cache exists
+        if not PywalCacheReader.cache_exists():
+            no_cache_frame = ttk.LabelFrame(content, text="No Pywal Cache Found", padding=20)
+            no_cache_frame.grid(row=0, column=0, sticky="nsew")
+
+            ttk.Label(
+                no_cache_frame,
+                text="Pywal cache not found at ~/.cache/wal/"
+                     "To use this feature:"
+                     "1. Install pywal: pip install pywal"
+                     "2. Run: wal -i /path/to/image"
+                     "3. Return here to load the generated colors",
+                justify="left",
+                foreground="orange"
+            ).pack(pady=20)
+            return
+
+        # Split into two columns: info and preview
+        left_frame = ttk.Frame(content)
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+
+        right_frame = ttk.Frame(content)
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=2)
+
+        # Left: Current scheme info
+        info_frame = ttk.LabelFrame(left_frame, text="Current Pywal Scheme", padding=10)
+        info_frame.pack(fill="both", expand=True)
+
+        self.pywal_info_text = tk.Text(info_frame, height=15, width=40, wrap="word")
+        self.pywal_info_text.pack(fill="both", expand=True)
+
+        # Right: Color preview
+        preview_frame = ttk.LabelFrame(right_frame, text="Color Preview", padding=10)
+        preview_frame.pack(fill="both", expand=True)
+        preview_frame.grid_rowconfigure(0, weight=1)
+        preview_frame.grid_columnconfigure(0, weight=1)
+
+        # Canvas for color swatches
+        canvas_frame = ttk.Frame(preview_frame)
+        canvas_frame.grid(row=0, column=0, sticky="nsew")
+        canvas_frame.grid_rowconfigure(0, weight=1)
+        canvas_frame.grid_columnconfigure(0, weight=1)
+
+        self.pywal_canvas = tk.Canvas(canvas_frame, bg="white")
+        scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.pywal_canvas.yview)
+
+        self.pywal_canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.pywal_canvas.grid(row=0, column=0, sticky="nsew")
+
+        # Action buttons
+        btn_frame = ttk.Frame(tab)
+        btn_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+
+        ttk.Button(btn_frame, text="📥 Apply to Alacritty",
+                  command=self.apply_pywal_to_alacritty).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="💾 Save to History",
+                  command=self.save_pywal_to_history).pack(side="left", padx=5)
+
+        # Load initial data
+        self.refresh_pywal_cache()
+
+    def refresh_pywal_cache(self):
+        """Refresh pywal cache display"""
+        if not PywalCacheReader.cache_exists():
+            return
+
+        # Load current scheme
+        self.pywal_current_scheme = PywalCacheReader.load_current_scheme()
+
+        if not self.pywal_current_scheme:
+            return
+
+        # Update info text
+        self.pywal_info_text.delete('1.0', tk.END)
+
+        wallpaper = PywalCacheReader.get_wallpaper_path()
+        if wallpaper:
+            self.pywal_info_text.insert(tk.END, f"Wallpaper: {wallpaper}")
+        special = self.pywal_current_scheme.get('special', {})
+        self.pywal_info_text.insert(tk.END, "Special Colors:")
+        for key, value in special.items():
+            self.pywal_info_text.insert(tk.END, f"  {key}: {value}")
+
+        colors = self.pywal_current_scheme.get('colors', {})
+        self.pywal_info_text.insert(tk.END, "Palette Colors:")
+        for i in range(16):
+            color_key = f'color{i}'
+            if color_key in colors:
+                self.pywal_info_text.insert(tk.END, f"  {color_key}: {colors[color_key]}")
+
+        # Draw color swatches
+        self.draw_pywal_colors()
+
+    def draw_pywal_colors(self):
+        """Draw pywal color swatches"""
+        self.pywal_canvas.delete("all")
+
+        if not self.pywal_current_scheme:
+            return
+
+        y = 10
+        x = 10
+
+        # Special colors
+        self.pywal_canvas.create_text(x, y, text="Special Colors", anchor="nw",
+                                      font=("", 11, "bold"))
+        y += 25
+
+        special = self.pywal_current_scheme.get('special', {})
+        for name, color in special.items():
+            self.pywal_canvas.create_rectangle(x, y, x + 150, y + 35,
+                                              fill=color, outline="black", width=2)
+            self.pywal_canvas.create_text(x + 160, y + 17, text=f"{name}: {color}",
+                                         anchor="w", font=("", 9))
+            y += 40
+
+        y += 10
+
+        # Color palette (normal + bright)
+        self.pywal_canvas.create_text(x, y, text="Terminal Palette", anchor="nw",
+                                      font=("", 11, "bold"))
+        y += 25
+
+        colors = self.pywal_current_scheme.get('colors', {})
+        color_names = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white']
+
+        for i in range(8):
+            normal_color = colors.get(f'color{i}', '#000000')
+            bright_color = colors.get(f'color{i+8}', '#000000')
+
+            # Normal color
+            self.pywal_canvas.create_rectangle(x, y, x + 70, y + 35,
+                                              fill=normal_color, outline="black", width=2)
+            self.pywal_canvas.create_text(x + 75, y + 17, text=f"{color_names[i]}",
+                                         anchor="w", font=("", 9))
+
+            # Bright color
+            self.pywal_canvas.create_rectangle(x + 200, y, x + 270, y + 35,
+                                              fill=bright_color, outline="black", width=2)
+            self.pywal_canvas.create_text(x + 275, y + 17, text=f"bright {color_names[i]}",
+                                         anchor="w", font=("", 9))
+
+            y += 40
+
+        self.pywal_canvas.config(scrollregion=self.pywal_canvas.bbox("all"))
+
+    def apply_pywal_to_alacritty(self):
+        """Apply pywal colors to Alacritty config"""
+        if not self.pywal_current_scheme:
+            messagebox.showwarning("Warning", "No pywal scheme loaded")
+            return
+
+        # Convert and apply
+        alacritty_colors = PywalCacheReader.convert_to_alacritty_format(self.pywal_current_scheme)
+        self.colors.update(alacritty_colors)
+        self.save_colors()
+
+        messagebox.showinfo("Success",
+                          "Pywal colors applied to Alacritty!"
+                          "Your terminal will update immediately.")
+
+    def save_pywal_to_history(self):
+        """Save current pywal scheme to history"""
+        if not self.pywal_current_scheme:
+            messagebox.showwarning("Warning", "No pywal scheme loaded")
+            return
+
+        wallpaper = PywalCacheReader.get_wallpaper_path()
+        name = f"Pywal: {Path(wallpaper).name if wallpaper else 'unknown'}"
+
+        alacritty_colors = PywalCacheReader.convert_to_alacritty_format(self.pywal_current_scheme)
+        self.add_to_history(name, alacritty_colors)
+
+        messagebox.showinfo("Success", "Pywal scheme saved to history!")
+
+
 
     def setup_history_tab(self, tab):
         tab.grid_rowconfigure(0, weight=1)
@@ -562,7 +846,7 @@ class AlacrittyColorEditor:
         label.grid(row=row, column=0, padx=5, pady=3, sticky="w")
 
         color_value = self.colors[key]
-        preview = tk.Canvas(parent, width=60, height=25, bg=color_value, 
+        preview = tk.Canvas(parent, width=60, height=25, bg=color_value,
                            highlightthickness=2, highlightbackground="gray")
         preview.grid(row=row, column=1, padx=5, pady=3)
 
@@ -613,7 +897,7 @@ class AlacrittyColorEditor:
             value_label = ttk.Label(top_frame, text=str(var.get()), font=("", 8))
             value_label.pack(side="right")
 
-            slider = ttk.Scale(slider_frame, from_=0, to=255, variable=var, 
+            slider = ttk.Scale(slider_frame, from_=0, to=255, variable=var,
                              orient="horizontal", command=update_from_sliders)
             slider.pack(fill="both", expand=True)
 
