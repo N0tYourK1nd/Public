@@ -103,6 +103,8 @@ create_container() {
     --device /dev/net/tun \
     --security-opt label=disable \
     --ipc=host \
+    --cap-add=NET_RAW \
+    --cap-add=NET_ADMIN \
     -v "$MOUNT_DIR/$name:/mnt/share" \
     "$GOLDEN_IMAGE" tail -f /dev/null
   log_action "Created container: $name"
@@ -226,6 +228,8 @@ golden_shell() {
       --device /dev/net/tun \
       --security-opt label=disable \
       --ipc=host \
+      --cap-add=NET_ADMIN \
+      --cap-add=NET_RAW \
       -v "$MOUNT_DIR/$GOLDEN_NAME:/mnt/share" \
       "$BASE_IMAGE" bash
     log_action "Created golden container: $GOLDEN_NAME"
@@ -249,6 +253,7 @@ restore_golden() {
     --device /dev/net/tun \
     --security-opt label=disable \
     --ipc=host \
+    --cap-add=NET_ADMIN \
     -v "$MOUNT_DIR/$GOLDEN_NAME:/mnt/share" \
     "$GOLDEN_IMAGE" bash
   log_action "Restored golden container from existing image: $GOLDEN_IMAGE"
@@ -293,6 +298,8 @@ recreate_golden() {
     --device /dev/net/tun \
     --security-opt label=disable \
     --ipc=host \
+    --cap-add=NET_ADMIN \
+    --cap-add=NET_RAW \
     -v "$MOUNT_DIR/$GOLDEN_NAME:/mnt/share" \
     "$BASE_IMAGE" bash
   log_action "Recreated golden container from base image"
