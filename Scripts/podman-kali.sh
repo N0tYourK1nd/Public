@@ -4,7 +4,7 @@ GOLDEN_NAME="kali-golden"
 GOLDEN_IMAGE="kali-golden:latest"
 LOG_DIR="$HOME/.kali-pentest/logs"
 MOUNT_DIR="/mnt/container"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.5.0"
 
 # Create log directory if it doesn't exist
 mkdir -p "$LOG_DIR"
@@ -54,6 +54,7 @@ Utilities:
   mount [name]            - Mount container filesystem for inspection
   umount [name]           - Unmount container filesystem
   remove-image [image]    - Remove a local image
+  fix-x11                 - Fixes XAUTH/XHOST mcookie bug
 
 Help:
   help                    - Show this help message
@@ -571,41 +572,48 @@ umount_container() {
   echo "Container '$name' filesystem unmounted."
 }
 
+fix_x11() {
+  xauth generate :0 . trusted
+  xhost +si:localuser:$SUDO_USER
+  xhost +si:localuser:root
+}
+
 # Main argument parsing
 case $1 in
-  create) create_container "$2" ;;
-  start) start_container "$2" ;;
-  connect) connect_container "$2" ;;
-  exec) shift; exec_command "$@" ;;
-  delete) delete_container "$2" ;;
-  restart) restart_container "$2" ;;
-  stop) stop_container "$2" ;;
-  pause) pause_container "$2" ;;
-  unpause) unpause_container "$2" ;;
-  golden) golden_shell ;;
-  commit) commit_golden ;;
-  update-base) update_base ;;
-  recreate-golden) recreate_golden ;;
-  restore-golden) restore_golden ;;
-  list) list_containers ;;
-  list-running) list_running ;;
-  list-stopped) list_stopped ;;
-  inspect) inspect_container "$2" ;;
-  logs) show_logs "$2" ;;
-  stats) show_stats "$2" ;;
   clean) clean_stopped ;;
   clean-all) clean_all_containers ;;
-  stop-all) stop_all_containers ;;
   cleanup-golden) cleanup_golden_images ;;
   clone) clone_container "$2" "$3" ;;
-  rename) rename_container "$2" "$3" ;;
+  commit) commit_golden ;;
+  connect) connect_container "$2" ;;
+  create) create_container "$2" ;;
+  delete) delete_container "$2" ;;
+  exec) shift; exec_command "$@" ;;
   export-container) export_container "$2" "$3" ;;
-  import-image) import_image "$2" "$3" ;;
-  list-images) list_images ;;
-  remove-image) remove_image "$2" ;;
+  fix-x11) fix_xss ;;
+  golden) golden_shell ;;
   help) usage ;;
+  import-image) import_image "$2" "$3" ;;
+  inspect) inspect_container "$2" ;;
+  list) list_containers ;;
+  list-images) list_images ;;
+  list-running) list_running ;;
+  list-stopped) list_stopped ;;
+  logs) show_logs "$2" ;;
   mount) mount_container "$2" ;;
+  pause) pause_container "$2" ;;
+  recreate-golden) recreate_golden ;;
+  remove-image) remove_image "$2" ;;
+  rename) rename_container "$2" "$3" ;;
+  restart) restart_container "$2" ;;
+  restore-golden) restore_golden ;;
+  start) start_container "$2" ;;
+  stats) show_stats "$2" ;;
+  stop) stop_container "$2" ;;
+  stop-all) stop_all_containers ;;
   umount) umount_container "$2" ;;
+  unpause) unpause_container "$2" ;;
+  update-base) update_base ;;
   version) version ;;
   *) usage ;;
 esac
