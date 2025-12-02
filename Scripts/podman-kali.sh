@@ -4,7 +4,8 @@ GOLDEN_NAME="kali-golden"
 GOLDEN_IMAGE="kali-golden:latest"
 LOG_DIR="$HOME/.kali-pentest/logs"
 MOUNT_DIR="/mnt/container"
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.6.0"
+X11_FIX_FILE="/tmp/x11fix"
 
 # Create log directory if it doesn't exist
 mkdir -p "$LOG_DIR"
@@ -104,8 +105,14 @@ create_container() {
     --device /dev/net/tun \
     --security-opt label=disable \
     --ipc=host \
-    --cap-add=NET_RAW \
     --cap-add=NET_ADMIN \
+    --cap-add=SYS_MODULE \
+    --cap-add=NET_RAW \
+    --sysctl="net.ipv4.conf.all.src_valid_mark=1" \
+    --sysctl="net.ipv4.conf.all.forwarding=1" \
+    --sysctl="net.ipv4.ip_forward=1" \
+    --restart unless-stopped \
+    --privileged \
     -v "$MOUNT_DIR/$name:/mnt/share" \
     "$GOLDEN_IMAGE" tail -f /dev/null
   log_action "Created container: $name"
@@ -131,9 +138,13 @@ connect_container() {
     echo "Error: Container name required"
     exit 1
   fi
+  if [ ! -f "$X11_FIX_FILE" ]; then
+    echo "X11 Forwarding fix not applied, auto-patching.."
+    fix_x11
+  fi
   check_container_exists "$name" || exit 1
   log_action "Connected to container: $name"
-  podman exec -it --user root "$name" bash
+  podman exec -it --user root --workdir "/root/" "$name" tmux
 }
 
 exec_command() {
@@ -576,6 +587,7 @@ fix_x11() {
   xauth generate :0 . trusted
   xhost +si:localuser:$SUDO_USER
   xhost +si:localuser:root
+  touch $X11_FIX_FILE
 }
 
 # Main argument parsing
@@ -590,7 +602,7 @@ case $1 in
   delete) delete_container "$2" ;;
   exec) shift; exec_command "$@" ;;
   export-container) export_container "$2" "$3" ;;
-  fix-x11) fix_xss ;;
+  fix-x11) fix_x11 ;;
   golden) golden_shell ;;
   help) usage ;;
   import-image) import_image "$2" "$3" ;;
@@ -617,3 +629,4 @@ case $1 in
   version) version ;;
   *) usage ;;
 esac
+
