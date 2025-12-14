@@ -4,7 +4,7 @@ GOLDEN_NAME="kali-golden"
 GOLDEN_IMAGE="kali-golden:latest"
 LOG_DIR="$HOME/.kali-pentest/logs"
 MOUNT_DIR="/mnt/container"
-SCRIPT_VERSION="1.8.0"
+SCRIPT_VERSION="1.9.0"
 X11_FIX_FILE="/tmp/x11fix"
 
 # Create log directory if it doesn't exist
@@ -98,38 +98,24 @@ create_container() {
   podman container exists "$name" && { echo "Error: Container '$name' already exists"; exit 1; }
   check_image_exists "$GOLDEN_IMAGE" || exit 1
   
-  # 1. Setup Directories & Persistent Hosts File
+  # 1. Setup Directories
   sudo mkdir -p "$MOUNT_DIR/$name"
-  
-  # Create a persistent hosts file if it doesn't exist
-  if [ ! -f "$MOUNT_DIR/$name/hosts" ]; then
-      echo "127.0.0.1   localhost" | sudo tee "$MOUNT_DIR/$name/hosts" > /dev/null
-      echo "::1         localhost" | sudo tee -a "$MOUNT_DIR/$name/hosts" > /dev/null
-      # Add the container name to its own hosts file
-      echo "# Custom hosts file for $name" | sudo tee -a "$MOUNT_DIR/$name/hosts" > /dev/null
-  fi
 
   # 2. Logic to find next available IP
-  # Gateway is 10.88.0.1, so we start checking at 10.88.0.2
   local base_ip="10.88.0"
   local octet=2
   local target_ip=""
   
   used_ips=$(sudo podman ps -aq | xargs -r sudo podman inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' | tr ' ' '\n' | grep "^$base_ip" || true)
 
-
   while true; do
       candidate="$base_ip.$octet"
       if echo "$used_ips" | grep -q "^$candidate$"; then
-          # IP exists, increment and try next
           ((octet++))
       else
-          # IP is free, assign it
           target_ip="$candidate"
           break
       fi
-      
-      # Safety break (optional: prevent infinite loops if subnet is full)
       if [ "$octet" -gt 254 ]; then
           echo "Error: No available IPs in $base_ip.0/24 range"
           exit 1
@@ -138,9 +124,21 @@ create_container() {
 
   echo "Assigning Static IP: $target_ip"
 
-  # 3. Create Container
+  # 3. NOW Create the persistent hosts file (Because target_ip is finally set!)
+  if [ ! -f "$MOUNT_DIR/$name/hosts" ]; then
+      echo "127.0.0.1   localhost" | sudo tee "$MOUNT_DIR/$name/hosts" > /dev/null
+      echo "::1         localhost" | sudo tee -a "$MOUNT_DIR/$name/hosts" > /dev/null
+      
+      # Now this will work because target_ip is "10.88.0.x"
+      echo "$target_ip    $name" | sudo tee -a "$MOUNT_DIR/$name/hosts" > /dev/null
+      
+      echo "# Custom hosts file for $name" | sudo tee -a "$MOUNT_DIR/$name/hosts" > /dev/null
+  fi
+
+  # 4. Create Container
   podman run -d --name "$name" \
     --ip "$target_ip" \
+    --hostname "$name" \
     --no-hosts \
     -v "$MOUNT_DIR/$name/hosts:/etc/hosts" \
     -e DISPLAY=$DISPLAY \
@@ -165,6 +163,7 @@ create_container() {
   echo "Container '$name' created with IP $target_ip"
   echo "Bidirectional sync: $MOUNT_DIR/$name <-> /mnt/share"
 }
+
 
 start_container() {
   local name=$1
