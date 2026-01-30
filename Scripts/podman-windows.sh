@@ -7,7 +7,7 @@ BASE_IMAGE="docker.io/dockurr/windows:latest"
 GOLDEN_NAME="windows-golden"
 LOG_DIR="$HOME/.windows-pentest/logs"
 STORAGE_BASE="$HOME/.windows-pentest/storage"
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.6.0"
 
 # Default Windows configuration
 DEFAULT_VERSION="11"
@@ -31,12 +31,13 @@ usage() {
 Usage: $0 {command} [options]
 
 Container Lifecycle:
-  create [name] [options]  - Create new Windows container (clones golden storage)
+  create [name] [options]  - Create new Windows container (instant CoW clone)
                              Options: --version=<ver> --ram=<size> --cpu=<cores>
                                       --disk=<size> --user=<name> --pass=<pwd>
                                       --fresh (skip golden, fresh install)
+                                      --full-copy (slow full copy instead of CoW)
   start [name]             - Start a stopped container
-  connect [name]           - Show connection info (RDP/Web)
+  connect [name]           - Show connection info (RDP/Web/VNC)
   delete [name]            - Stop and remove a container
   restart [name]           - Restart a container
   stop [name]              - Stop a running container (graceful 2min timeout)
@@ -46,6 +47,9 @@ Golden Image Management:
   golden [options]         - Create/start golden Windows container
                              Options: --version=<ver> --ram=<size> --cpu=<cores>
   adopt [path]             - Adopt existing Windows storage as golden image
+  convert-golden           - Convert golden to QCOW2 for instant cloning
+  commit [name]            - Save container's storage as the new golden image
+  golden-status            - Show golden image storage info
   snapshot [name]          - Create a snapshot of container's storage
   restore [name] [snap]    - Restore container from snapshot
   update-base              - Pull latest upstream dockur/windows image
@@ -67,13 +71,14 @@ Batch Operations:
   stop-all                 - Stop all running containers (excluding golden)
 
 Utilities:
-  clone [name] [new_name]  - Clone container (copies Windows disk)
+  clone [name] [new_name]  - Clone container (instant CoW)
   rename [old] [new]       - Rename a container
   export-storage [n] [path] - Export container's Windows disk
   import-storage [path] [name] - Import Windows disk to new container
   remove-image [image]     - Remove a local image
   rdp [name]               - Open RDP connection (requires xfreerdp)
   web [name]               - Open web viewer in browser
+  vnc [name]               - Open VNC connection (requires vncviewer)
 
 Windows Versions (use with --version):
   11/11l/11e  - Windows 11 Pro/LTSC/Enterprise
@@ -91,13 +96,14 @@ Help:
 
 Examples:
   $0 adopt ./windows              # Use existing installation as golden
-  $0 create malware-test          # Clone golden to new test environment
-  $0 create fresh-win10 --fresh --version=10l  # Fresh install, no clone
-  $0 snapshot malware-test        # Save state before testing
-  $0 restore malware-test         # Revert to clean state
+  $0 convert-golden               # Convert to QCOW2 for instant clones
+  $0 create test1                 # Instant clone from golden
+  $0 create test2                 # Another instant clone
+  $0 snapshot test1               # Save state before testing
+  $0 restore test1                # Revert to clean state
 
 EOF
-exit 1
+  exit 1
 }
 
 log_action() {
@@ -135,7 +141,55 @@ get_storage_path() {
 }
 
 get_golden_storage() {
-  echo "$STORAGE_BASE/$GOLDEN_NAME"
+  local gs="$STORAGE_BASE/$GOLDEN_NAME"
+  if [ -L "$gs" ]; then
+    gs=$(readlink -f "$gs")
+  fi
+  echo "$gs"
+}
+
+# Find the Windows disk image in a storage directory
+find_disk_image() {
+  local storage_dir=$1
+  
+  # Check common disk image names - qcow2 first (preferred)
+  for disk in "data.qcow2" "data.img"; do
+    if [ -f "$storage_dir/$disk" ]; then
+      echo "$storage_dir/$disk"
+      return 0
+    fi
+  done
+  
+  return 1
+}
+
+# Get container IP address
+get_container_ip() {
+  local name=$1
+  local ip=""
+  
+  # Try different methods to get IP
+  ip=$(podman inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$name" 2>/dev/null)
+  
+  # If empty, try alternative format
+  if [ -z "$ip" ]; then
+    ip=$(podman inspect --format='{{.NetworkSettings.IPAddress}}' "$name" 2>/dev/null)
+  fi
+  
+  echo "$ip"
+}
+
+# Check if container is running
+is_container_running() {
+  local name=$1
+  local state=$(podman inspect --format='{{.State.Status}}' "$name" 2>/dev/null)
+  [ "$state" = "running" ]
+}
+
+# Get container state
+get_container_state() {
+  local name=$1
+  podman inspect --format='{{.State.Status}}' "$name" 2>/dev/null
 }
 
 # Find next available port pair (web + rdp)
@@ -185,6 +239,7 @@ parse_options() {
   WIN_USERNAME="$DEFAULT_USERNAME"
   WIN_PASSWORD="$DEFAULT_PASSWORD"
   FRESH_INSTALL="false"
+  FULL_COPY="false"
   
   for arg in "$@"; do
     case $arg in
@@ -195,35 +250,257 @@ parse_options() {
       --user=*) WIN_USERNAME="${arg#*=}" ;;
       --pass=*) WIN_PASSWORD="${arg#*=}" ;;
       --fresh) FRESH_INSTALL="true" ;;
+      --full-copy) FULL_COPY="true" ;;
     esac
   done
 }
 
-# Copy additional files from source to target storage
-copy_extra_files() {
+# Check if a path is accessible (for backing file validation)
+check_path_accessible() {
+  local path=$1
+  [ -f "$path" ] && [ -r "$path" ]
+}
+
+# Create a standalone QCOW2 copy (no backing file dependency)
+create_standalone_qcow2() {
+  local source_disk=$1
+  local target_disk=$2
+  
+  echo "Creating standalone QCOW2 copy..."
+  echo "This takes longer but avoids backing file issues."
+  
+  if command -v qemu-img &>/dev/null; then
+    # Convert to standalone qcow2 (no backing file)
+    qemu-img convert -p -O qcow2 "$source_disk" "$target_disk"
+    return $?
+  else
+    # Fallback to cp
+    cp --sparse=always "$source_disk" "$target_disk"
+    return $?
+  fi
+}
+
+# Fast clone using QCOW2 backing files (only if golden is in STORAGE_BASE)
+fast_clone_storage() {
   local source_dir=$1
   local target_dir=$2
   
-  # Copy ROM files
-  for f in "$source_dir"/*.rom; do
-    [ -f "$f" ] && cp "$f" "$target_dir/"
+  mkdir -p "$target_dir"
+  
+  local source_disk=$(find_disk_image "$source_dir")
+  if [ -z "$source_disk" ]; then
+    echo "Error: No source disk found in $source_dir"
+    return 1
+  fi
+  
+  local disk_name=$(basename "$source_disk")
+  
+  # Copy metadata files first
+  for f in windows.base windows.boot windows.mac windows.rom windows.vars windows.ver; do
+    [ -f "$source_dir/$f" ] && cp "$source_dir/$f" "$target_dir/"
   done
   
-  # Copy FD files
-  for f in "$source_dir"/*.fd; do
-    [ -f "$f" ] && cp "$f" "$target_dir/"
-  done
+  # Check if source is within STORAGE_BASE (safe for backing files)
+  # Backing files with absolute paths outside the storage can cause issues
+  local source_real=$(realpath "$source_dir")
+  local storage_real=$(realpath "$STORAGE_BASE")
   
-  # Copy ISO files
-  for f in "$source_dir"/*.iso; do
-    [ -f "$f" ] && cp "$f" "$target_dir/"
-  done
+  # If source is a symlink to somewhere else, we can't use backing files reliably
+  if [ -L "$STORAGE_BASE/$GOLDEN_NAME" ]; then
+    echo "Golden storage is symlinked to external location."
+    echo "Using standalone copy for reliability..."
+    create_standalone_qcow2 "$source_disk" "$target_dir/data.qcow2"
+    return $?
+  fi
+  
+  # QCOW2 backing file (instant, but only works if paths are consistent)
+  if [[ "$disk_name" == *.qcow2 ]] && command -v qemu-img &>/dev/null; then
+    echo "Creating instant CoW clone (QCOW2 backing file)..."
+    if qemu-img create -f qcow2 -b "$source_disk" -F qcow2 "$target_dir/data.qcow2" 2>/dev/null; then
+      # Verify the backing file is accessible
+      local backing_check=$(qemu-img info "$target_dir/data.qcow2" 2>&1)
+      if echo "$backing_check" | grep -q "Could not open backing file"; then
+        echo "Warning: Backing file not accessible, creating standalone copy..."
+        rm -f "$target_dir/data.qcow2"
+        create_standalone_qcow2 "$source_disk" "$target_dir/data.qcow2"
+      else
+        echo "Done! (instant)"
+      fi
+      return 0
+    fi
+  fi
+  
+  # Raw image - convert to qcow2
+  if [[ "$disk_name" == *.img ]] && command -v qemu-img &>/dev/null; then
+    echo "Converting raw image to QCOW2..."
+    create_standalone_qcow2 "$source_disk" "$target_dir/data.qcow2"
+    return $?
+  fi
+  
+  # Fallback: Full copy
+  echo "Copying disk..."
+  if command -v rsync &>/dev/null; then
+    rsync -a --sparse --info=progress2 "$source_disk" "$target_dir/"
+  else
+    cp -a --sparse=always "$source_disk" "$target_dir/"
+  fi
+  
+  return 0
+}
+
+# Convert golden image to QCOW2 for better cloning
+convert_golden() {
+  local golden_storage=$(get_golden_storage)
+  local disk=$(find_disk_image "$golden_storage")
+  
+  if [ -z "$disk" ]; then
+    echo "Error: No golden disk found at $golden_storage"
+    exit 1
+  fi
+  
+  local disk_name=$(basename "$disk")
+  
+  if [[ "$disk_name" == *.qcow2 ]]; then
+    echo "Golden image is already QCOW2 format."
+    if command -v qemu-img &>/dev/null; then
+      qemu-img info "$disk" | head -5
+    fi
+    return 0
+  fi
+  
+  if ! command -v qemu-img &>/dev/null; then
+    echo "Error: qemu-img not found. Install qemu-utils package."
+    exit 1
+  fi
+  
+  echo "Converting golden image to QCOW2 format..."
+  echo "Source: $disk"
+  echo ""
+  
+  local actual_size=$(du -h "$disk" | cut -f1)
+  local apparent_size=$(ls -lh "$disk" | awk '{print $5}')
+  echo "Size: $actual_size actual / $apparent_size apparent"
+  echo ""
+  
+  # Check if golden container is running
+  if podman container exists "$GOLDEN_NAME" 2>/dev/null; then
+    local state=$(get_container_state "$GOLDEN_NAME")
+    if [ "$state" = "running" ]; then
+      echo "Golden container is running. Stop it first for safe conversion."
+      read -p "Stop golden container? (y/N) " -n 1 -r
+      echo
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        stop_container "$GOLDEN_NAME"
+      else
+        echo "Aborted."
+        return
+      fi
+    fi
+  fi
+  
+  local qcow2_disk="$golden_storage/data.qcow2"
+  
+  echo "Converting (this takes several minutes)..."
+  
+  if qemu-img convert -p -O qcow2 -o preallocation=off "$disk" "$qcow2_disk"; then
+    local new_size=$(du -h "$qcow2_disk" | cut -f1)
+    echo ""
+    echo "Done! New size: $new_size"
+    
+    # Verify
+    if qemu-img check "$qcow2_disk" 2>&1 | grep -q "No errors"; then
+      echo "Verification passed!"
+      
+      read -p "Remove original raw image? (y/N) " -n 1 -r
+      echo
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm "$disk"
+        echo "Original removed."
+      else
+        mv "$disk" "${disk}.backup"
+        echo "Original backed up to ${disk}.backup"
+      fi
+      
+      echo ""
+      echo "Golden image converted successfully!"
+    else
+      echo "Warning: Verification found issues. Keeping original."
+      rm -f "$qcow2_disk"
+    fi
+  else
+    echo "Error: Conversion failed"
+    rm -f "$qcow2_disk"
+    exit 1
+  fi
+  
+  log_action "Converted golden to QCOW2"
+}
+
+# Show golden storage status
+golden_status() {
+  local golden_storage=$(get_golden_storage)
+  
+  echo "Golden Image Status"
+  echo "==================="
+  echo ""
+  echo "Storage path: $STORAGE_BASE/$GOLDEN_NAME"
+  
+  if [ -L "$STORAGE_BASE/$GOLDEN_NAME" ]; then
+    echo "Type: Symlink -> $golden_storage"
+    echo ""
+    echo "⚠ Note: Symlinked storage uses standalone copies (slower but reliable)"
+  elif [ -d "$golden_storage" ]; then
+    echo "Type: Directory (instant CoW cloning available)"
+  else
+    echo "Status: NOT CONFIGURED"
+    echo ""
+    echo "Run: $0 adopt <path-to-windows-storage>"
+    return 1
+  fi
+  
+  echo ""
+  echo "Contents:"
+  ls -lh "$golden_storage" 2>/dev/null || echo "  (empty)"
+  
+  echo ""
+  local disk=$(find_disk_image "$golden_storage")
+  if [ -n "$disk" ]; then
+    local disk_name=$(basename "$disk")
+    local actual_size=$(du -h "$disk" 2>/dev/null | cut -f1)
+    local apparent_size=$(ls -lh "$disk" 2>/dev/null | awk '{print $5}')
+    
+    echo "Windows disk: $disk_name"
+    echo "Size: $actual_size actual / $apparent_size apparent"
+    
+    if [[ "$disk_name" == *.qcow2 ]]; then
+      echo "Format: QCOW2 ✓"
+    else
+      echo "Format: Raw image"
+      echo ""
+      echo "Tip: Run '$0 convert-golden' to convert to QCOW2"
+    fi
+    
+    echo ""
+    echo "Metadata files:"
+    for f in windows.base windows.boot windows.mac windows.rom windows.vars windows.ver; do
+      if [ -f "$golden_storage/$f" ]; then
+        echo "  ✓ $f"
+      fi
+    done
+  else
+    echo "ERROR: No Windows disk image found!"
+    echo "Expected: data.qcow2 or data.img"
+  fi
 }
 
 # Adopt existing Windows storage as golden image
 adopt_golden() {
   local source_path=$1
-  [ -z "$source_path" ] && { echo "Error: Source path required"; exit 1; }
+  if [ -z "$source_path" ]; then
+    echo "Error: Source path required"
+    echo "Usage: $0 adopt <path-to-windows-storage>"
+    exit 1
+  fi
   
   # Resolve to absolute path
   source_path=$(realpath "$source_path" 2>/dev/null || echo "$source_path")
@@ -233,51 +510,79 @@ adopt_golden() {
     exit 1
   fi
   
+  echo "Checking source directory..."
+  echo "Path: $source_path"
+  echo ""
+  echo "Contents:"
+  ls -lh "$source_path"
+  echo ""
+  
   # Check for Windows disk image
-  if [ ! -f "$source_path/data.qcow2" ] && [ ! -f "$source_path/data.img" ]; then
-    echo "Warning: No Windows disk image found in '$source_path'"
+  local disk=$(find_disk_image "$source_path")
+  if [ -n "$disk" ]; then
+    local actual_size=$(du -h "$disk" | cut -f1)
+    local apparent_size=$(ls -lh "$disk" | awk '{print $5}')
+    echo "Found Windows disk: $(basename "$disk")"
+    echo "Size: $actual_size actual / $apparent_size apparent"
+  else
+    echo "WARNING: No Windows disk image found!"
     echo "Expected: data.qcow2 or data.img"
     read -p "Continue anyway? (y/N) " -n 1 -r
     echo
     [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; return; }
   fi
   
-  local golden_storage=$(get_golden_storage)
+  local golden_storage="$STORAGE_BASE/$GOLDEN_NAME"
   
   # Check if golden already exists
-  if [ -d "$golden_storage" ] && [ "$(ls -A "$golden_storage" 2>/dev/null)" ]; then
+  if [ -e "$golden_storage" ]; then
+    echo ""
     echo "Warning: Golden storage already exists at $golden_storage"
+    if [ -L "$golden_storage" ]; then
+      echo "  (currently a symlink to: $(readlink -f "$golden_storage"))"
+    fi
     read -p "Replace it? (y/N) " -n 1 -r
     echo
     [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; return; }
     rm -rf "$golden_storage"
   fi
   
-  echo "Adopting '$source_path' as golden image..."
-  
-  echo "Options:"
-  echo "  1) Move - Fast, original location becomes empty"
-  echo "  2) Copy - Slow but preserves original"
-  echo "  3) Link - Fastest, uses original location"
+  echo ""
+  echo "How do you want to adopt '$source_path'?"
+  echo ""
+  echo "  1) Copy - Recommended, enables instant CoW cloning"
+  echo "  2) Move - Fast, original location becomes empty"
+  echo "  3) Link - Fastest setup, but clones will be slower"
+  echo ""
   read -p "Choose [1/2/3]: " -n 1 -r choice
   echo
   
+  mkdir -p "$(dirname "$golden_storage")"
+  
   case $choice in
     1)
-      mkdir -p "$(dirname "$golden_storage")"
-      mv "$source_path" "$golden_storage"
-      echo "Moved to $golden_storage"
+      echo "Copying (this may take a while for large disks)..."
+      mkdir -p "$golden_storage"
+      if command -v rsync &>/dev/null; then
+        rsync -a --sparse --info=progress2 "$source_path/" "$golden_storage/"
+      else
+        cp -a --sparse=always "$source_path/." "$golden_storage/"
+      fi
+      echo "Copied to $golden_storage"
+      echo ""
+      echo "✓ Instant CoW cloning is now available!"
       ;;
     2)
-      mkdir -p "$golden_storage"
-      echo "Copying (this may take a while for large disks)..."
-      cp -a "$source_path/." "$golden_storage/"
-      echo "Copied to $golden_storage"
+      mv "$source_path" "$golden_storage"
+      echo "Moved to $golden_storage"
+      echo ""
+      echo "✓ Instant CoW cloning is now available!"
       ;;
     3)
-      mkdir -p "$(dirname "$golden_storage")"
       ln -s "$source_path" "$golden_storage"
-      echo "Linked to $golden_storage -> $source_path"
+      echo "Linked: $golden_storage -> $source_path"
+      echo ""
+      echo "Note: Clones will use standalone copies (slower but reliable)"
       ;;
     *)
       echo "Invalid choice. Aborted."
@@ -287,18 +592,100 @@ adopt_golden() {
   
   log_action "Adopted golden storage from: $source_path"
   echo ""
-  echo "Golden image ready!"
-  echo "Storage: $golden_storage"
+  
+  # Show status
+  golden_status
+  
+  # Check if conversion is recommended
+  local new_disk=$(find_disk_image "$(get_golden_storage)")
+  if [ -n "$new_disk" ] && [[ "$new_disk" == *.img ]]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "RECOMMENDED: Convert to QCOW2 format:"
+    echo "  $0 convert-golden"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  fi
+}
+
+# Commit a container's storage as the new golden image
+commit_golden() {
+  local name=$1
+  
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    echo "Usage: $0 commit <container-name>"
+    exit 1
+  fi
+  
+  local storage_path=$(get_storage_path "$name")
+  if [ -L "$storage_path" ]; then
+    storage_path=$(readlink -f "$storage_path")
+  fi
+  
+  local disk=$(find_disk_image "$storage_path")
+  if [ -z "$disk" ]; then
+    echo "Error: No Windows disk found for '$name'"
+    exit 1
+  fi
+  
+  local golden_storage=$(get_golden_storage)
+  
+  echo "This will save '$name' as the new golden image."
+  echo "Source: $storage_path"
+  echo "Target: $STORAGE_BASE/$GOLDEN_NAME"
   echo ""
-  echo "You can now:"
-  echo "  $0 golden          # Start golden container to customize"
-  echo "  $0 create test1    # Create test container from golden"
+  
+  # Stop container for consistent copy
+  if podman container exists "$name" 2>/dev/null; then
+    if is_container_running "$name"; then
+      echo "Container is running. Stop it for a clean commit."
+      read -p "Stop container now? (y/N) " -n 1 -r
+      echo
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        stop_container "$name"
+      else
+        echo "Warning: Committing while running may cause inconsistencies."
+      fi
+    fi
+  fi
+  
+  read -p "Commit '$name' as new golden image? (y/N) " -n 1 -r
+  echo
+  [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; return; }
+  
+  # Remove symlink if exists, backup if directory
+  if [ -L "$STORAGE_BASE/$GOLDEN_NAME" ]; then
+    rm "$STORAGE_BASE/$GOLDEN_NAME"
+  elif [ -d "$golden_storage" ] && [ "$(ls -A "$golden_storage" 2>/dev/null)" ]; then
+    local backup="${golden_storage}.backup-$(date +%Y%m%d-%H%M%S)"
+    echo "Backing up existing golden to: $backup"
+    mv "$golden_storage" "$backup"
+  fi
+  
+  # Create new golden storage with standalone copy
+  mkdir -p "$STORAGE_BASE/$GOLDEN_NAME"
+  echo "Copying storage (this ensures standalone golden image)..."
+  
+  if command -v rsync &>/dev/null; then
+    rsync -a --sparse --info=progress2 "$storage_path/" "$STORAGE_BASE/$GOLDEN_NAME/"
+  else
+    cp -a --sparse=always "$storage_path/." "$STORAGE_BASE/$GOLDEN_NAME/"
+  fi
+  
+  log_action "Committed $name as new golden image"
+  echo ""
+  echo "Done! '$name' is now the golden image."
+  echo "New containers will use instant CoW cloning."
 }
 
 create_container() {
   local name=$1
   shift
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   
   if podman container exists "$name" 2>/dev/null; then
     echo "Error: Container '$name' already exists"
@@ -311,36 +698,45 @@ create_container() {
   local storage_path=$(get_storage_path "$name")
   local golden_storage=$(get_golden_storage)
   
-  # Setup storage
-  mkdir -p "$storage_path"
-  
   # Clone from golden unless --fresh specified
   if [ "$FRESH_INSTALL" != "true" ]; then
-    if [ -d "$golden_storage" ] && [ -f "$golden_storage/data.qcow2" ]; then
-      echo "Cloning Windows disk from golden image..."
-      echo "This may take a few minutes for large disks..."
-      
-      # Use qemu-img for CoW copy if available (much faster)
-      if command -v qemu-img &>/dev/null; then
-        # Create a backing file based copy (instant, CoW)
-        qemu-img create -f qcow2 -b "$golden_storage/data.qcow2" -F qcow2 "$storage_path/data.qcow2"
-        echo "Created CoW clone (instant, space-efficient)"
+    local golden_disk=$(find_disk_image "$golden_storage")
+    
+    if [ -n "$golden_disk" ]; then
+      if [ "$FULL_COPY" = "true" ]; then
+        echo "Creating full copy..."
+        mkdir -p "$storage_path"
+        if command -v rsync &>/dev/null; then
+          rsync -a --sparse --info=progress2 "$golden_storage/" "$storage_path/"
+        else
+          cp -a --sparse=always "$golden_storage/." "$storage_path/"
+        fi
       else
-        # Fallback to regular copy
-        cp "$golden_storage/data.qcow2" "$storage_path/data.qcow2"
-        echo "Created full copy"
+        fast_clone_storage "$golden_storage" "$storage_path" || exit 1
       fi
-      
-      # Copy other files (rom, fd, iso)
-      copy_extra_files "$golden_storage" "$storage_path"
     else
-      echo "No golden image found. Creating fresh Windows installation."
-      echo "This will download and install Windows (may take 30+ minutes)."
-      read -p "Continue? (y/N) " -n 1 -r
+      echo "No golden image found."
+      echo ""
+      echo "Options:"
+      echo "  1) Create fresh Windows installation (downloads ISO)"
+      echo "  2) Abort and setup golden image first"
+      echo ""
+      read -p "Choose [1/2]: " -n 1 -r
       echo
-      [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; return; }
-      FRESH_INSTALL="true"
+      
+      case $REPLY in
+        1) 
+          FRESH_INSTALL="true"
+          mkdir -p "$storage_path"
+          ;;
+        *) 
+          echo "Aborted. Run: $0 adopt <path-to-windows-storage>"
+          exit 1 
+          ;;
+      esac
     fi
+  else
+    mkdir -p "$storage_path"
   fi
   
   # Get unique ports
@@ -350,8 +746,11 @@ create_container() {
   
   echo ""
   echo "Creating Windows container '$name'..."
-  [ "$FRESH_INSTALL" = "true" ] && echo "  Mode: Fresh installation"
-  [ "$FRESH_INSTALL" != "true" ] && echo "  Mode: Cloned from golden"
+  if [ "$FRESH_INSTALL" = "true" ]; then
+    echo "  Mode: Fresh installation (Windows $WIN_VERSION)"
+  else
+    echo "  Mode: Cloned from golden"
+  fi
   echo "  RAM: $WIN_RAM"
   echo "  CPU Cores: $WIN_CPU"
   echo "  Web Port: $web_port"
@@ -381,9 +780,21 @@ create_container() {
 
   register_ports "$name" "$web_port" "$rdp_port"
   
+  # Wait and check if container is actually running
+  sleep 3
+  if ! is_container_running "$name"; then
+    echo ""
+    echo "Warning: Container may have failed to start!"
+    echo "Check logs with: $0 logs $name"
+    echo ""
+    local exit_code=$(podman inspect --format='{{.State.ExitCode}}' "$name" 2>/dev/null)
+    echo "Exit code: $exit_code"
+    return 1
+  fi
+  
   log_action "Created container: $name (Web: $web_port, RDP: $rdp_port)"
   echo ""
-  echo "Container '$name' created!"
+  echo "Container '$name' created and running!"
   echo ""
   echo "Access:"
   echo "  Web Viewer: http://localhost:$web_port"
@@ -392,73 +803,102 @@ create_container() {
   echo "Commands:"
   echo "  $0 web $name    # Open web viewer"
   echo "  $0 rdp $name    # Connect via RDP"
+  echo "  $0 vnc $name    # Connect via VNC"
   echo "  $0 stop $name   # Stop container"
 }
 
 start_container() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   check_container_exists "$name" || exit 1
   check_kvm
   
   podman start "$name"
-  log_action "Started container: $name"
   
-  local port_info=$(get_container_ports "$name")
-  if [ -n "$port_info" ]; then
-    local web_port=$(echo "$port_info" | cut -d: -f1)
-    local rdp_port=$(echo "$port_info" | cut -d: -f2)
-    echo "Container '$name' started"
-    echo "  Web: http://localhost:$web_port"
-    echo "  RDP: localhost:$rdp_port"
+  # Wait for container to initialize
+  sleep 3
+  
+  if is_container_running "$name"; then
+    log_action "Started container: $name"
+    local port_info=$(get_container_ports "$name")
+    if [ -n "$port_info" ]; then
+      local web_port=$(echo "$port_info" | cut -d: -f1)
+      local rdp_port=$(echo "$port_info" | cut -d: -f2)
+      echo "Container '$name' started"
+      echo "  Web: http://localhost:$web_port"
+      echo "  RDP: localhost:$rdp_port"
+    else
+      echo "Container '$name' started"
+    fi
   else
-    echo "Container '$name' started"
+    echo "Error: Container failed to start!"
+    echo "Check logs: $0 logs $name"
+    local exit_code=$(podman inspect --format='{{.State.ExitCode}}' "$name" 2>/dev/null)
+    echo "Exit code: $exit_code"
   fi
 }
 
 connect_container() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   check_container_exists "$name" || exit 1
   
   local port_info=$(get_container_ports "$name")
-  if [ -n "$port_info" ]; then
-    local web_port=$(echo "$port_info" | cut -d: -f1)
-    local rdp_port=$(echo "$port_info" | cut -d: -f2)
-    
-    echo "Connection Info for '$name':"
-    echo ""
-    echo "Web Viewer:"
-    echo "  URL: http://localhost:$web_port"
-    echo ""
-    echo "RDP (recommended):"
-    echo "  Host: localhost:$rdp_port"
-    echo "  Username: Docker"
-    echo "  Password: admin"
-    echo ""
-    echo "Commands:"
-    echo "  $0 web $name"
-    echo "  $0 rdp $name"
-  else
-    echo "Port info not found. Checking container..."
-    podman port "$name"
+  local web_port=$(echo "$port_info" | cut -d: -f1)
+  local rdp_port=$(echo "$port_info" | cut -d: -f2)
+  local state=$(get_container_state "$name")
+  
+  echo "Connection Info for '$name':"
+  echo ""
+  echo "Status: $state"
+  echo ""
+  echo "Web Viewer:"
+  echo "  URL: http://localhost:$web_port"
+  echo ""
+  echo "RDP (recommended for regular use):"
+  echo "  Host: localhost:$rdp_port"
+  echo "  Username: Docker"
+  echo "  Password: admin"
+  echo ""
+  
+  if [ "$state" = "running" ]; then
+    local ip=$(get_container_ip "$name")
+    if [ -n "$ip" ]; then
+      echo "VNC (direct to QEMU):"
+      echo "  Address: $ip:5900"
+    fi
   fi
+  
+  echo ""
+  echo "Quick commands:"
+  echo "  $0 web $name"
+  echo "  $0 rdp $name"
+  echo "  $0 vnc $name"
 }
 
 delete_container() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   check_container_exists "$name" || exit 1
   
   if [ "$name" = "$GOLDEN_NAME" ]; then
     echo "Warning: This will delete the golden container."
-    echo "Golden storage at $(get_golden_storage) will remain."
+    echo "Golden storage will remain."
     read -p "Continue? (y/N) " -n 1 -r
     echo
     [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; return; }
   fi
   
-  echo "Stopping container '$name' (graceful Windows shutdown, up to 2 minutes)..."
+  echo "Stopping container '$name'..."
   podman stop -t 120 "$name" 2>/dev/null
   podman rm "$name"
   
@@ -468,35 +908,52 @@ delete_container() {
   echo "Container '$name' removed"
   
   local storage_path=$(get_storage_path "$name")
-  if [ -d "$storage_path" ]; then
-    echo ""
-    echo "Storage remains at: $storage_path"
-    read -p "Delete storage too? (y/N) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-      rm -rf "$storage_path"
-      echo "Storage deleted"
+  if [ -d "$storage_path" ] && [ ! -L "$storage_path" ] && [ "$name" != "$GOLDEN_NAME" ]; then
+    local disk=$(find_disk_image "$storage_path")
+    if [ -n "$disk" ]; then
+      local size=$(du -h "$disk" 2>/dev/null | cut -f1)
+      echo ""
+      echo "Storage remains at: $storage_path ($size)"
+      read -p "Delete storage too? (y/N) " -n 1 -r
+      echo
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm -rf "$storage_path"
+        echo "Storage deleted"
+      fi
     fi
   fi
 }
 
 restart_container() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   check_container_exists "$name" || exit 1
   
-  echo "Restarting '$name' (may take up to 2 minutes)..."
+  echo "Restarting '$name'..."
   podman restart -t 120 "$name"
-  log_action "Restarted container: $name"
-  echo "Container '$name' restarted"
+  
+  sleep 3
+  if is_container_running "$name"; then
+    log_action "Restarted container: $name"
+    echo "Container '$name' restarted"
+  else
+    echo "Error: Container failed to restart!"
+    echo "Check logs: $0 logs $name"
+  fi
 }
 
 stop_container() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   check_container_exists "$name" || exit 1
   
-  echo "Stopping '$name' gracefully (Windows shutdown, up to 2 minutes)..."
+  echo "Stopping '$name' gracefully (up to 2 minutes)..."
   podman stop -t 120 "$name"
   log_action "Stopped container: $name"
   echo "Container '$name' stopped"
@@ -504,7 +961,10 @@ stop_container() {
 
 force_stop_container() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   check_container_exists "$name" || exit 1
   
   echo "Force stopping '$name'..."
@@ -521,22 +981,31 @@ golden_shell() {
   mkdir -p "$golden_storage"
   
   if podman container exists "$GOLDEN_NAME" 2>/dev/null; then
-    local state=$(podman inspect --format='{{.State.Status}}' "$GOLDEN_NAME")
-    if [ "$state" != "running" ]; then
+    if ! is_container_running "$GOLDEN_NAME"; then
       echo "Starting golden container..."
       podman start "$GOLDEN_NAME"
+      sleep 3
+    fi
+    
+    if is_container_running "$GOLDEN_NAME"; then
+      echo "Golden container is running."
+    else
+      echo "Error: Golden container failed to start!"
+      echo "Check logs: $0 logs $GOLDEN_NAME"
+      return 1
     fi
   else
     echo "Creating golden container..."
     
-    # Check if we have existing storage
     local version_env=""
-    if [ ! -f "$golden_storage/data.qcow2" ]; then
+    local existing_disk=$(find_disk_image "$golden_storage")
+    
+    if [ -z "$existing_disk" ]; then
       echo "No existing Windows installation found."
       echo "Will create fresh Windows $WIN_VERSION installation."
       version_env="-e VERSION=$WIN_VERSION"
     else
-      echo "Using existing Windows installation from $golden_storage"
+      echo "Using existing Windows installation: $(basename "$existing_disk")"
     fi
     
     podman run -d --name "$GOLDEN_NAME" \
@@ -555,7 +1024,15 @@ golden_shell() {
       "$BASE_IMAGE"
     
     register_ports "$GOLDEN_NAME" "8006" "3389"
-    log_action "Created golden container: $GOLDEN_NAME"
+    
+    sleep 3
+    if is_container_running "$GOLDEN_NAME"; then
+      log_action "Created golden container: $GOLDEN_NAME"
+    else
+      echo "Error: Golden container failed to start!"
+      echo "Check logs: $0 logs $GOLDEN_NAME"
+      return 1
+    fi
   fi
   
   echo ""
@@ -565,26 +1042,38 @@ golden_shell() {
   echo "  Web: http://localhost:8006"
   echo "  RDP: localhost:3389 (user: Docker, pass: admin)"
   echo ""
-  echo "Customize this Windows installation, then new containers will clone it."
+  echo "Customize Windows, then new containers will clone it."
   echo "Storage: $golden_storage"
 }
 
 # Snapshot management
 create_snapshot() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   
   local storage_path=$(get_storage_path "$name")
-  [ ! -d "$storage_path" ] && { echo "Error: No storage found for '$name'"; exit 1; }
-  [ ! -f "$storage_path/data.qcow2" ] && { echo "Error: No disk image found"; exit 1; }
+  if [ -L "$storage_path" ]; then
+    storage_path=$(readlink -f "$storage_path")
+  fi
+  
+  if [ ! -d "$storage_path" ]; then
+    echo "Error: No storage found for '$name'"
+    exit 1
+  fi
+  
+  local disk=$(find_disk_image "$storage_path")
+  if [ -z "$disk" ]; then
+    echo "Error: No disk image found"
+    exit 1
+  fi
   
   # Stop container for consistent snapshot
-  if podman container exists "$name" 2>/dev/null; then
-    local state=$(podman inspect --format='{{.State.Status}}' "$name" 2>/dev/null)
-    if [ "$state" = "running" ]; then
-      echo "Stopping container for consistent snapshot..."
-      podman stop -t 120 "$name"
-    fi
+  if podman container exists "$name" 2>/dev/null && is_container_running "$name"; then
+    echo "Stopping container for consistent snapshot..."
+    podman stop -t 120 "$name"
   fi
   
   local snapshot_name="snapshot-$(date +%Y%m%d-%H%M%S)"
@@ -593,96 +1082,123 @@ create_snapshot() {
   
   echo "Creating snapshot '$snapshot_name'..."
   
-  if command -v qemu-img &>/dev/null; then
-    # Create internal QCOW2 snapshot (fast, space-efficient)
-    qemu-img snapshot -c "$snapshot_name" "$storage_path/data.qcow2"
-    echo "$snapshot_name" >> "$snapshot_dir/list.txt"
-    echo "Snapshot created: $snapshot_name (internal)"
+  local disk_name=$(basename "$disk")
+  
+  if [[ "$disk_name" == *.qcow2 ]] && command -v qemu-img &>/dev/null; then
+    qemu-img snapshot -c "$snapshot_name" "$disk"
+    echo "Snapshot created: $snapshot_name (internal qcow2)"
   else
-    # Fallback: copy the disk
-    cp "$storage_path/data.qcow2" "$snapshot_dir/${snapshot_name}.qcow2"
-    echo "Snapshot created: $snapshot_name (full copy)"
+    echo "Copying disk..."
+    if command -v rsync &>/dev/null; then
+      rsync -a --sparse --info=progress2 "$disk" "$snapshot_dir/${snapshot_name}.img"
+    else
+      cp --sparse=always "$disk" "$snapshot_dir/${snapshot_name}.img"
+    fi
+    echo "Snapshot created: $snapshot_name (file copy)"
   fi
   
   log_action "Created snapshot for $name: $snapshot_name"
-  echo "Done! Restore with: $0 restore $name $snapshot_name"
+  echo ""
+  echo "Restore with: $0 restore $name $snapshot_name"
 }
 
 restore_snapshot() {
   local name=$1
   local snapshot=$2
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   
   local storage_path=$(get_storage_path "$name")
-  [ ! -d "$storage_path" ] && { echo "Error: No storage found for '$name'"; exit 1; }
+  if [ -L "$storage_path" ]; then
+    storage_path=$(readlink -f "$storage_path")
+  fi
+  
+  local disk=$(find_disk_image "$storage_path")
+  if [ -z "$disk" ]; then
+    echo "Error: No disk image found"
+    exit 1
+  fi
   
   # Stop container
-  if podman container exists "$name" 2>/dev/null; then
-    local state=$(podman inspect --format='{{.State.Status}}' "$name" 2>/dev/null)
-    if [ "$state" = "running" ]; then
-      echo "Stopping container..."
-      podman stop -t 120 "$name"
-    fi
+  if podman container exists "$name" 2>/dev/null && is_container_running "$name"; then
+    echo "Stopping container..."
+    podman stop -t 120 "$name"
   fi
   
   if [ -z "$snapshot" ]; then
-    # List available snapshots
     echo "Available snapshots for '$name':"
-    if command -v qemu-img &>/dev/null; then
-      qemu-img snapshot -l "$storage_path/data.qcow2" 2>/dev/null || echo "  (none)"
+    echo ""
+    if [[ "$(basename "$disk")" == *.qcow2 ]] && command -v qemu-img &>/dev/null; then
+      echo "Internal snapshots:"
+      qemu-img snapshot -l "$disk" 2>/dev/null || echo "  (none)"
     fi
     if [ -d "$storage_path/snapshots" ]; then
-      ls -1 "$storage_path/snapshots"/*.qcow2 2>/dev/null | xargs -I{} basename {} .qcow2 || true
+      echo ""
+      echo "File snapshots:"
+      ls -lh "$storage_path/snapshots"/ 2>/dev/null || echo "  (none)"
     fi
     return
   fi
   
   echo "Restoring snapshot '$snapshot'..."
   
-  if command -v qemu-img &>/dev/null; then
-    # Try internal snapshot first
-    if qemu-img snapshot -a "$snapshot" "$storage_path/data.qcow2" 2>/dev/null; then
-      echo "Restored internal snapshot: $snapshot"
-    elif [ -f "$storage_path/snapshots/${snapshot}.qcow2" ]; then
-      cp "$storage_path/snapshots/${snapshot}.qcow2" "$storage_path/data.qcow2"
-      echo "Restored from file: $snapshot"
-    else
-      echo "Error: Snapshot '$snapshot' not found"
-      exit 1
-    fi
-  else
-    if [ -f "$storage_path/snapshots/${snapshot}.qcow2" ]; then
-      cp "$storage_path/snapshots/${snapshot}.qcow2" "$storage_path/data.qcow2"
-      echo "Restored from file: $snapshot"
-    else
-      echo "Error: Snapshot '$snapshot' not found"
-      exit 1
+  # Try internal qcow2 snapshot
+  if [[ "$(basename "$disk")" == *.qcow2 ]] && command -v qemu-img &>/dev/null; then
+    if qemu-img snapshot -a "$snapshot" "$disk" 2>/dev/null; then
+      echo "Restored: $snapshot"
+      log_action "Restored snapshot for $name: $snapshot"
+      echo ""
+      echo "Start with: $0 start $name"
+      return
     fi
   fi
   
-  log_action "Restored snapshot for $name: $snapshot"
-  echo "Done! Start container with: $0 start $name"
+  # Try file snapshot
+  for ext in img qcow2; do
+    if [ -f "$storage_path/snapshots/${snapshot}.${ext}" ]; then
+      echo "Restoring from file..."
+      cp --sparse=always "$storage_path/snapshots/${snapshot}.${ext}" "$disk"
+      echo "Restored: $snapshot"
+      log_action "Restored snapshot for $name: $snapshot"
+      echo ""
+      echo "Start with: $0 start $name"
+      return
+    fi
+  done
+  
+  echo "Error: Snapshot '$snapshot' not found"
+  exit 1
 }
 
 list_snapshots() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   
   local storage_path=$(get_storage_path "$name")
-  [ ! -d "$storage_path" ] && { echo "Error: No storage found for '$name'"; exit 1; }
+  if [ -L "$storage_path" ]; then
+    storage_path=$(readlink -f "$storage_path")
+  fi
+  
+  local disk=$(find_disk_image "$storage_path")
   
   echo "Snapshots for '$name':"
   echo ""
   
-  if command -v qemu-img &>/dev/null && [ -f "$storage_path/data.qcow2" ]; then
-    echo "Internal snapshots:"
-    qemu-img snapshot -l "$storage_path/data.qcow2" 2>/dev/null || echo "  (none)"
+  if [ -n "$disk" ] && [[ "$(basename "$disk")" == *.qcow2 ]] && command -v qemu-img &>/dev/null; then
+    echo "Internal QCOW2 snapshots:"
+    qemu-img snapshot -l "$disk" 2>/dev/null || echo "  (none)"
   fi
   
   if [ -d "$storage_path/snapshots" ]; then
     echo ""
     echo "File snapshots:"
-    ls -lh "$storage_path/snapshots"/*.qcow2 2>/dev/null || echo "  (none)"
+    ls -lh "$storage_path/snapshots"/ 2>/dev/null || echo "  (none)"
   fi
 }
 
@@ -715,16 +1231,22 @@ list_images() {
 
 inspect_container() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   check_container_exists "$name" || exit 1
   podman inspect "$name"
 }
 
 show_logs() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   check_container_exists "$name" || exit 1
-  podman logs -f "$name"
+  podman logs "$name"
 }
 
 show_stats() {
@@ -739,57 +1261,59 @@ show_stats() {
 
 show_ports() {
   local name=$1
-  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  if [ -z "$name" ]; then
+    echo "Error: Container name required"
+    exit 1
+  fi
   check_container_exists "$name" || exit 1
-  
-  echo "Port mappings for '$name':"
   podman port "$name"
 }
 
 clean_stopped() {
   local count=$(podman ps -a --filter "status=exited" -q | wc -l)
-  [ "$count" -eq 0 ] && { echo "No stopped containers to clean"; return; }
+  if [ "$count" -eq 0 ]; then
+    echo "No stopped containers"
+    return
+  fi
   
   echo "Found $count stopped containers."
   read -p "Remove them? (y/N) " -n 1 -r
   echo
-  [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; return; }
+  [[ ! $REPLY =~ ^[Yy]$ ]] && return
   
   podman container prune -f
   log_action "Cleaned stopped containers"
-  echo "Cleaned $count stopped containers"
 }
 
 clean_all_containers() {
   echo "This will stop and remove ALL containers except golden."
   read -p "Continue? (y/N) " -n 1 -r
   echo
-  [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; return; }
+  [[ ! $REPLY =~ ^[Yy]$ ]] && return
   
   for cid in $(podman ps -a -q); do
     [ -z "$cid" ] && continue
-    cname=$(podman inspect --format='{{.Name}}' "$cid" | sed 's|^/||')
+    local cname=$(podman inspect --format='{{.Name}}' "$cid" | sed 's|^/||')
     if [ "$cname" != "$GOLDEN_NAME" ]; then
       echo "Removing $cname..."
-      podman stop -t 120 "$cid" 2>/dev/null
+      podman stop -t 60 "$cid" 2>/dev/null
       podman rm "$cid"
       sed -i "/:$cname$/d" "$PORT_TRACK_FILE" 2>/dev/null
     fi
   done
   
   log_action "Cleaned all containers except golden"
-  echo "Done"
 }
 
 stop_all_containers() {
   echo "This will stop all running containers except golden."
   read -p "Continue? (y/N) " -n 1 -r
   echo
-  [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; return; }
+  [[ ! $REPLY =~ ^[Yy]$ ]] && return
   
   for cid in $(podman ps -q); do
     [ -z "$cid" ] && continue
-    cname=$(podman inspect --format='{{.Name}}' "$cid" | sed 's|^/||')
+    local cname=$(podman inspect --format='{{.Name}}' "$cid" | sed 's|^/||')
     if [ "$cname" != "$GOLDEN_NAME" ]; then
       echo "Stopping $cname..."
       podman stop -t 120 "$cid"
@@ -797,41 +1321,36 @@ stop_all_containers() {
   done
   
   log_action "Stopped all containers except golden"
-  echo "Done"
 }
 
 clone_container() {
   local source=$1
   local target=$2
-  [ -z "$source" ] || [ -z "$target" ] && { echo "Error: Source and target names required"; exit 1; }
   
-  podman container exists "$target" 2>/dev/null && { echo "Error: Target '$target' already exists"; exit 1; }
+  if [ -z "$source" ] || [ -z "$target" ]; then
+    echo "Usage: $0 clone <source> <target>"
+    exit 1
+  fi
+  
+  if podman container exists "$target" 2>/dev/null; then
+    echo "Error: Target '$target' already exists"
+    exit 1
+  fi
   
   local source_storage=$(get_storage_path "$source")
-  local target_storage=$(get_storage_path "$target")
+  [ -L "$source_storage" ] && source_storage=$(readlink -f "$source_storage")
   
-  [ ! -d "$source_storage" ] && { echo "Error: Source storage not found"; exit 1; }
-  [ ! -f "$source_storage/data.qcow2" ] && { echo "Error: Source disk not found"; exit 1; }
+  local source_disk=$(find_disk_image "$source_storage")
+  [ -z "$source_disk" ] && { echo "Error: Source disk not found"; exit 1; }
   
   # Stop source for consistent copy
-  if podman container exists "$source" 2>/dev/null; then
-    local state=$(podman inspect --format='{{.State.Status}}' "$source")
-    if [ "$state" = "running" ]; then
-      echo "Stopping source container for consistent clone..."
-      podman stop -t 120 "$source"
-    fi
+  if podman container exists "$source" 2>/dev/null && is_container_running "$source"; then
+    echo "Stopping source container..."
+    podman stop -t 120 "$source"
   fi
   
-  echo "Cloning storage..."
-  mkdir -p "$target_storage"
-  
-  if command -v qemu-img &>/dev/null; then
-    qemu-img create -f qcow2 -b "$source_storage/data.qcow2" -F qcow2 "$target_storage/data.qcow2"
-    echo "Created CoW clone"
-  else
-    cp "$source_storage/data.qcow2" "$target_storage/data.qcow2"
-    echo "Created full copy"
-  fi
+  echo "Cloning '$source' to '$target'..."
+  fast_clone_storage "$source_storage" "$(get_storage_path "$target")"
   
   local ports=$(get_next_ports)
   local web_port=$(echo "$ports" | cut -d: -f1)
@@ -847,12 +1366,13 @@ clone_container() {
     --device /dev/net/tun \
     --cap-add NET_ADMIN \
     --stop-timeout 120 \
-    -v "$target_storage:/storage:Z" \
+    -v "$(get_storage_path "$target"):/storage:Z" \
     "$BASE_IMAGE"
   
   register_ports "$target" "$web_port" "$rdp_port"
   log_action "Cloned: $source -> $target"
   
+  echo ""
   echo "Cloned '$source' to '$target'"
   echo "  Web: http://localhost:$web_port"
   echo "  RDP: localhost:$rdp_port"
@@ -861,12 +1381,12 @@ clone_container() {
 rename_container() {
   local old=$1
   local new=$2
-  [ -z "$old" ] || [ -z "$new" ] && { echo "Error: Old and new names required"; exit 1; }
+  
+  [ -z "$old" ] || [ -z "$new" ] && { echo "Usage: $0 rename <old> <new>"; exit 1; }
   check_container_exists "$old" || exit 1
   
   podman rename "$old" "$new"
   
-  # Update port tracking
   local port_info=$(get_container_ports "$old")
   if [ -n "$port_info" ]; then
     local web_port=$(echo "$port_info" | cut -d: -f1)
@@ -875,11 +1395,9 @@ rename_container() {
     register_ports "$new" "$web_port" "$rdp_port"
   fi
   
-  # Rename storage directory
   local old_storage=$(get_storage_path "$old")
-  local new_storage=$(get_storage_path "$new")
-  if [ -d "$old_storage" ]; then
-    mv "$old_storage" "$new_storage"
+  if [ -d "$old_storage" ] && [ ! -L "$old_storage" ]; then
+    mv "$old_storage" "$(get_storage_path "$new")"
   fi
   
   log_action "Renamed: $old -> $new"
@@ -889,33 +1407,37 @@ rename_container() {
 export_storage() {
   local name=$1
   local path=$2
-  [ -z "$name" ] || [ -z "$path" ] && { echo "Error: Container name and path required"; exit 1; }
+  
+  [ -z "$name" ] || [ -z "$path" ] && { echo "Usage: $0 export-storage <name> <path>"; exit 1; }
   
   local storage_path=$(get_storage_path "$name")
-  [ ! -f "$storage_path/data.qcow2" ] && { echo "Error: No disk image found"; exit 1; }
+  [ -L "$storage_path" ] && storage_path=$(readlink -f "$storage_path")
   
-  echo "Exporting Windows disk..."
+  local disk=$(find_disk_image "$storage_path")
+  [ -z "$disk" ] && { echo "Error: No disk found"; exit 1; }
+  
+  echo "Exporting: $disk"
   
   if command -v pigz &>/dev/null; then
-    pigz -c "$storage_path/data.qcow2" > "$path"
+    pigz -c "$disk" > "$path"
   else
-    gzip -c "$storage_path/data.qcow2" > "$path"
+    gzip -c "$disk" > "$path"
   fi
   
-  log_action "Exported storage: $name to $path"
-  echo "Exported to: $path"
+  echo "Exported to: $path ($(du -h "$path" | cut -f1))"
 }
 
 import_storage() {
   local path=$1
   local name=$2
-  [ -z "$path" ] || [ -z "$name" ] && { echo "Error: Path and container name required"; exit 1; }
+  
+  [ -z "$path" ] || [ -z "$name" ] && { echo "Usage: $0 import-storage <path> <name>"; exit 1; }
   [ ! -f "$path" ] && { echo "Error: File not found: $path"; exit 1; }
   
   local storage_path=$(get_storage_path "$name")
   mkdir -p "$storage_path"
   
-  echo "Importing Windows disk..."
+  echo "Importing..."
   
   if [[ "$path" == *.gz ]]; then
     if command -v pigz &>/dev/null; then
@@ -924,12 +1446,11 @@ import_storage() {
       gunzip -c "$path" > "$storage_path/data.qcow2"
     fi
   else
-    cp "$path" "$storage_path/data.qcow2"
+    cp --sparse=always "$path" "$storage_path/data.qcow2"
   fi
   
-  log_action "Imported storage: $path to $name"
   echo "Imported to: $storage_path"
-  echo "Create container with: $0 create $name"
+  echo "Create container: $0 create $name"
 }
 
 remove_image() {
@@ -937,8 +1458,7 @@ remove_image() {
   [ -z "$image" ] && { echo "Error: Image name required"; exit 1; }
   check_image_exists "$image" || exit 1
   podman rmi "$image"
-  log_action "Removed image: $image"
-  echo "Image '$image' removed"
+  echo "Removed: $image"
 }
 
 open_rdp() {
@@ -946,19 +1466,24 @@ open_rdp() {
   [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
   check_container_exists "$name" || exit 1
   
-  local port_info=$(get_container_ports "$name")
-  local rdp_port="3389"
-  [ -n "$port_info" ] && rdp_port=$(echo "$port_info" | cut -d: -f2)
+  if ! is_container_running "$name"; then
+    echo "Error: Container '$name' is not running"
+    echo "Start it: $0 start $name"
+    exit 1
+  fi
   
-  if command -v xfreerdp &>/dev/null; then
-    echo "Connecting to localhost:$rdp_port..."
-    xfreerdp /v:localhost:$rdp_port /u:Docker /p:admin /dynamic-resolution +clipboard &
-  elif command -v xfreerdp3 &>/dev/null; then
-    echo "Connecting to localhost:$rdp_port..."
+  local port_info=$(get_container_ports "$name")
+  local rdp_port=$(echo "$port_info" | cut -d: -f2)
+  [ -z "$rdp_port" ] && rdp_port="3389"
+  
+  echo "Connecting to localhost:$rdp_port..."
+  
+  if command -v xfreerdp3 &>/dev/null; then
     xfreerdp3 /v:localhost:$rdp_port /u:Docker /p:admin /dynamic-resolution +clipboard &
+  elif command -v xfreerdp &>/dev/null; then
+    xfreerdp /v:localhost:$rdp_port /u:Docker /p:admin /dynamic-resolution +clipboard &
   else
-    echo "xfreerdp not found. Install: apt install freerdp2-x11"
-    echo ""
+    echo "xfreerdp not found."
     echo "Manual: localhost:$rdp_port (Docker/admin)"
   fi
 }
@@ -968,21 +1493,53 @@ open_web() {
   [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
   check_container_exists "$name" || exit 1
   
-  local port_info=$(get_container_ports "$name")
-  local web_port="8006"
-  [ -n "$port_info" ] && web_port=$(echo "$port_info" | cut -d: -f1)
-  
-  local url="http://localhost:$web_port"
-  
-  if command -v xdg-open &>/dev/null; then
-    xdg-open "$url" &
-  elif command -v firefox &>/dev/null; then
-    firefox "$url" &
-  else
-    echo "Open: $url"
+  if ! is_container_running "$name"; then
+    echo "Error: Container '$name' is not running"
+    echo "Start it: $0 start $name"
+    exit 1
   fi
   
+  local port_info=$(get_container_ports "$name")
+  local web_port=$(echo "$port_info" | cut -d: -f1)
+  [ -z "$web_port" ] && web_port="8006"
+  
+  local url="http://localhost:$web_port"
   echo "Opening: $url"
+  
+  if command -v xdg-open &>/dev/null; then
+    xdg-open "$url" 2>/dev/null &
+  else
+    echo "Open manually: $url"
+  fi
+}
+
+open_vnc() {
+  local name=$1
+  [ -z "$name" ] && { echo "Error: Container name required"; exit 1; }
+  check_container_exists "$name" || exit 1
+  
+  if ! is_container_running "$name"; then
+    echo "Error: Container '$name' is not running"
+    echo "Start it: $0 start $name"
+    exit 1
+  fi
+  
+  local ip=$(get_container_ip "$name")
+  
+  if [ -z "$ip" ]; then
+    echo "Error: Could not get container IP"
+    echo "Try: podman inspect $name | grep IPAddress"
+    exit 1
+  fi
+  
+  echo "Connecting to $ip:5900..."
+  
+  if command -v vncviewer &>/dev/null; then
+    vncviewer "$ip:5900" &
+  else
+    echo "vncviewer not found."
+    echo "Manual: vncviewer $ip:5900"
+  fi
 }
 
 version() {
@@ -995,12 +1552,15 @@ case ${1:-} in
   clean) clean_stopped ;;
   clean-all) clean_all_containers ;;
   clone) clone_container "$2" "$3" ;;
+  commit) commit_golden "$2" ;;
   connect) connect_container "$2" ;;
+  convert-golden) convert_golden ;;
   create) shift; create_container "$@" ;;
   delete) delete_container "$2" ;;
   export-storage) export_storage "$2" "$3" ;;
   force-stop) force_stop_container "$2" ;;
   golden) shift; golden_shell "$@" ;;
+  golden-status) golden_status ;;
   help) usage ;;
   import-storage) import_storage "$2" "$3" ;;
   inspect) inspect_container "$2" ;;
@@ -1023,6 +1583,7 @@ case ${1:-} in
   stop-all) stop_all_containers ;;
   update-base) update_base ;;
   version) version ;;
+  vnc) open_vnc "$2" ;;
   web) open_web "$2" ;;
   *) usage ;;
 esac
