@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-labctl.py - Unified Lab Container Management Tool v1.0.0
-
-Merges podman-kali.sh (v1.9.0) and podman-windows.sh (v1.6.0) into a single
-Python 3 script with enhanced features.  Uses only Python stdlib (no pip).
-
+labctl.py - NYK
 Usage: labctl [--dry-run] [--verbose] <command> [args]
 """
 
@@ -91,10 +87,10 @@ DEFAULTS: dict = {
         "storage_base":     str(Path.home() / ".windows-pentest/storage"),
         "default_version":  "11",
         "default_ram":      "4G",
-        "default_cpu":      "4",
+        "default_cpu":      "2",
         "default_disk":     "64G",
-        "default_user":     "Administrator",
-        "default_pass":     "Password",
+        "default_user":     "Docker",
+        "default_pass":     "admin",
     },
     "network": {
         "name":    "lab-net",
@@ -390,6 +386,51 @@ class Podman:
             print(f"{Colors.DIM}$ {' '.join(full)}{Colors.RESET}")
         os.execvp(full[0], full)
 
+    def get_image_ref(self, ref: str) -> str:
+        r = self.run(["inspect", "--format", "{{.ImageName}}", ref],
+                     check=False, capture=True)
+        img = (r.stdout or "").strip()
+        if img:
+            return img
+        r = self.run(["inspect", "--format", "{{.Image}}", ref],
+                     check=False, capture=True)
+        return (r.stdout or "").strip()
+
+    def resolve_ref(self, ref: str) -> list[str]:
+        ref = (ref or "").strip()
+        if not ref:
+            return []
+
+        # 1) Exact name
+        if self.container_exists(ref):
+            return [ref]
+
+        # 2) Treat as ID (or unique ID prefix) -> name via inspect
+        n = self.get_container_name(ref)
+        if n:
+            return [n.lstrip("/")]
+
+        # 3) Prefix search over all containers (names + IDs)
+        r = self.run(["ps", "-aq"], check=False, capture=True)
+        ids = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+        matches = []
+        for cid in ids:
+            name = self.get_container_name(cid).lstrip("/")
+            if not name:
+                continue
+            if name == ref or name.startswith(ref) or cid.startswith(ref):
+                matches.append(name)
+
+        # De-dupe, stable order
+        seen = set()
+        out = []
+        for m in matches:
+            if m not in seen:
+                seen.add(m)
+                out.append(m)
+        return out
+
+
 
 # ── NetworkManager ─────────────────────────────────────────────────────────────
 class NetworkManager:
@@ -452,6 +493,9 @@ def _log(log_dir: Path, log_file: str, msg: str):
         fh.write(f"[{ts}] {msg}\n")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LinuxManager – mirrors podman-kali.sh v1.9.0
+# ══════════════════════════════════════════════════════════════════════════════
 class LinuxManager:
     LOG_FILE = "kali-podman.log"
 
@@ -997,6 +1041,9 @@ class LinuxManager:
             error(f"Container '{name}' does not exist")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# WindowsManager – mirrors podman-windows.sh v1.6.0
+# ══════════════════════════════════════════════════════════════════════════════
 class WindowsManager:
     LOG_FILE = "windows-podman.log"
 
@@ -1921,7 +1968,9 @@ class WindowsManager:
             error(f"Container '{name}' does not exist")
 
 
-
+# ══════════════════════════════════════════════════════════════════════════════
+# LabManager
+# ══════════════════════════════════════════════════════════════════════════════
 class LabManager:
     def __init__(self, cfg: Config, podman: Podman, net: NetworkManager,
                  linux: "LinuxManager", windows: "WindowsManager",
@@ -2059,307 +2108,204 @@ class LabManager:
 # CLI – argument parser
 # ══════════════════════════════════════════════════════════════════════════════
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the argument parser with organized command groups."""
     p = argparse.ArgumentParser(
         prog="labctl",
-        description="Unified lab container management (Linux & Windows via Podman)",
+        description="Unified lab container management (Linux + Windows via Podman)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Command Groups:
-  Container Lifecycle    - create, start, stop, restart, delete
-  Container Management   - connect, exec, inspect, logs, stats, pause, unpause, mount, umount
-  Container Operations   - clone, rename, snapshot, restore, list-snapshots, force-stop
-  Golden Image          - golden, commit, convert-golden, golden-status, adopt
-  Batch Operations      - list, list-running, list-stopped, clean, clean-all, stop-all
-  Import/Export         - export-container, import-image, export-storage, import-storage
-  Connectivity          - rdp, web, vnc, ports
-  Lab Management        - lab create/start/stop/delete/status/list
-  Configuration         - config show/set/reset
-  Utilities             - update-base, remove-image, version, help
-
-Examples:
-  labctl create mylab --type linux
-  labctl start mylab
-  labctl connect mylab
-  labctl lab create pentest --config lab.json
-  labctl config show
-        """
     )
-
-    # Global options
-    p.add_argument("--dry-run", action="store_true", 
+    p.add_argument("--dry-run", action="store_true",
                    help="Print commands without executing")
-    p.add_argument("--verbose", "-v", action="store_true", 
+    p.add_argument("--verbose", "-v", action="store_true",
                    help="Print commands before executing")
 
-    sub = p.add_subparsers(dest="command", metavar="command")
+    sub = p.add_subparsers(dest="command", metavar="<command>")
 
-    # ============================================================================
-    # CONTAINER LIFECYCLE COMMANDS
-    # ============================================================================
+    # ── helpers ──
+    def _name(sp): sp.add_argument("name", help="Container name")
+    def _type(sp, required=False):
+        sp.add_argument("--type", choices=["linux", "windows"],
+                        required=required,
+                        default=None,
+                        help="Container type (auto-detected from registry if omitted)")
 
-    # CREATE
-    c = sub.add_parser("create", help="Create a new container",
-                       description="Create a new Linux or Windows container")
-    _add_name_arg(c)
-    _add_type_arg(c, required=True)
+    # ── create ──
+    c = sub.add_parser("create", help="Create a container")
+    _name(c); _type(c, required=True)
+    c.add_argument("--version",   default="", help="(Windows) OS version")
+    c.add_argument("--ram",       default="", help="(Windows) RAM size, e.g. 4G")
+    c.add_argument("--cpu",       default="", help="(Windows) CPU core count")
+    c.add_argument("--disk",      default="", help="(Windows) disk size, e.g. 64G")
+    c.add_argument("--user",      default="", help="(Windows) username")
+    c.add_argument("--pass",      dest="password", default="",
+                   help="(Windows) password")
+    c.add_argument("--fresh",     action="store_true",
+                   help="(Windows) skip golden, fresh install")
+    c.add_argument("--full-copy", dest="full_copy", action="store_true",
+                   help="(Windows) full copy instead of CoW")
 
-    win_opts = c.add_argument_group("Windows options")
-    win_opts.add_argument("--version", default="", help="Windows OS version")
-    win_opts.add_argument("--ram", default="", help="RAM size (e.g., 4G)")
-    win_opts.add_argument("--cpu", default="", help="CPU core count")
-    win_opts.add_argument("--disk", default="", help="Disk size (e.g., 64G)")
-    win_opts.add_argument("--user", default="", help="Username")
-    win_opts.add_argument("--pass", dest="password", default="", help="Password")
-    win_opts.add_argument("--fresh", action="store_true", 
-                         help="Skip golden, fresh install")
-    win_opts.add_argument("--full-copy", dest="fullcopy", action="store_true",
-                         help="Full copy instead of CoW")
-
-    # START, STOP, RESTART, DELETE
-    for cmd, helptext in [
-        ("start", "Start a stopped container"),
-        ("stop", "Stop a running container"),
+    # ── universal single-container commands ──
+    for cmd, help_text in [
+        ("start",   "Start a stopped container"),
+        ("stop",    "Stop a running container"),
         ("restart", "Restart a container"),
-        ("delete", "Stop and remove a container"),
-    ]:
-        sp = sub.add_parser(cmd, help=helptext)
-        _add_name_arg(sp)
-        _add_type_arg(sp)
-
-    # ============================================================================
-    # CONTAINER MANAGEMENT COMMANDS
-    # ============================================================================
-
-    # CONNECT, INSPECT, LOGS
-    for cmd, helptext in [
+        ("delete",  "Stop and remove a container"),
         ("connect", "Connect interactively to a container"),
         ("inspect", "Show detailed container info"),
-        ("logs", "Show container logs"),
-        ("pause", "Pause a container (Linux)"),
+        ("logs",    "Show container logs"),
+        ("pause",   "Pause a container (Linux)"),
         ("unpause", "Unpause a container (Linux)"),
-        ("mount", "Mount container filesystem (Linux)"),
-        ("umount", "Unmount container filesystem (Linux)"),
+        ("mount",   "Mount container filesystem (Linux)"),
+        ("umount",  "Unmount container filesystem (Linux)"),
+        ("force-stop", "Force stop a container (Windows)"),
+        ("ports",   "Show port mappings (Windows)"),
+        ("snapshot","Create a snapshot (Windows)"),
+        ("list-snapshots", "List snapshots (Windows)"),
     ]:
-        sp = sub.add_parser(cmd, help=helptext)
-        _add_name_arg(sp)
-        _add_type_arg(sp)
+        sp = sub.add_parser(cmd, help=help_text)
+        _name(sp); _type(sp)
 
-    # EXEC
+    # ── exec ──
     sp = sub.add_parser("exec", help="Execute command in container (Linux)")
-    _add_name_arg(sp)
-    _add_type_arg(sp)
+    _name(sp); _type(sp)
     sp.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to execute")
 
-    # STATS
-    sp = sub.add_parser("stats", help="Show resource usage statistics")
+    # ── stats ──
+    sp = sub.add_parser("stats", help="Show resource usage")
     sp.add_argument("name", nargs="?", default="", help="Container name (optional)")
-    _add_type_arg(sp)
+    _type(sp)
 
-    # ============================================================================
-    # CONTAINER OPERATIONS
-    # ============================================================================
-
-    # CLONE
+    # ── clone ──
     sp = sub.add_parser("clone", help="Clone a container")
-    sp.add_argument("source", help="Source container name")
-    sp.add_argument("target", help="Target container name")
-    _add_type_arg(sp)
+    sp.add_argument("source"); sp.add_argument("target"); _type(sp)
 
-    # RENAME
+    # ── rename ──
     sp = sub.add_parser("rename", help="Rename a container")
-    sp.add_argument("old", help="Current container name")
-    sp.add_argument("new", help="New container name")
-    _add_type_arg(sp)
+    sp.add_argument("old"); sp.add_argument("new"); _type(sp)
 
-    # SNAPSHOT, LIST-SNAPSHOTS, FORCE-STOP, PORTS
-    for cmd, helptext in [
-        ("snapshot", "Create a snapshot (Windows)"),
-        ("list-snapshots", "List snapshots (Windows)"),
-        ("force-stop", "Force stop a container (Windows)"),
-        ("ports", "Show port mappings (Windows)"),
-    ]:
-        sp = sub.add_parser(cmd, help=helptext)
-        _add_name_arg(sp)
-        _add_type_arg(sp)
-
-    # RESTORE
-    sp = sub.add_parser("restore", help="Restore from snapshot (Windows)")
-    _add_name_arg(sp)
-    sp.add_argument("snapshot", nargs="?", default="", help="Snapshot name")
-    _add_type_arg(sp)
-
-    # ============================================================================
-    # GOLDEN IMAGE COMMANDS
-    # ============================================================================
-
-    # GOLDEN
-    sp = sub.add_parser("golden", 
-                       help="Shell into golden container (Linux) or start it (Windows)")
-    _add_type_arg(sp, required=True)
-    win_opts = sp.add_argument_group("Windows options")
-    win_opts.add_argument("--version", default="", help="Windows OS version")
-    win_opts.add_argument("--ram", default="", help="RAM size")
-    win_opts.add_argument("--cpu", default="", help="CPU cores")
-
-    # COMMIT
-    sp = sub.add_parser("commit", 
-                       help="Commit golden container to image (Linux) or save as golden (Windows)")
-    sp.add_argument("name", nargs="?", default="", 
-                   help="Container name (required for Windows)")
-    _add_type_arg(sp, required=True)
-
-    # CONVERT-GOLDEN, GOLDEN-STATUS
-    for cmd, helptext in [
-        ("convert-golden", "Convert golden to storage (Windows)"),
-        ("golden-status", "Show golden status (Windows)"),
-    ]:
-        sp = sub.add_parser(cmd, help=helptext)
-        _add_type_arg(sp)
-
-    # ADOPT
-    sp = sub.add_parser("adopt", help="Adopt existing Windows storage as golden")
-    sp.add_argument("path", help="Path to storage directory")
-    _add_type_arg(sp)
-
-    # ============================================================================
-    # BATCH OPERATIONS
-    # ============================================================================
-
-    # LIST
+    # ── list ──
     sp = sub.add_parser("list", help="List containers")
-    _add_type_arg(sp)
-    sp.add_argument("--running", action="store_true", help="Only running containers")
-    sp.add_argument("--stopped", action="store_true", help="Only stopped containers")
+    _type(sp)
+    sp.add_argument("--running", action="store_true", help="Only running")
+    sp.add_argument("--stopped", action="store_true", help="Only stopped")
 
-    # LIST-RUNNING, LIST-STOPPED, CLEAN, CLEAN-ALL, STOP-ALL
-    for cmd, helptext in [
-        ("list-running", "List running containers"),
-        ("list-stopped", "List stopped containers"),
-        ("clean", "Remove stopped containers"),
-        ("clean-all", "Remove all containers except golden"),
-        ("stop-all", "Stop all containers except golden"),
-    ]:
-        sp = sub.add_parser(cmd, help=helptext)
-        _add_type_arg(sp)
+    # ── list-running / list-stopped (legacy compat) ──
+    for cmd, help_text in [("list-running",  "List running containers"),
+                            ("list-stopped",  "List stopped containers")]:
+        sp = sub.add_parser(cmd, help=help_text); _type(sp)
 
-    # ============================================================================
-    # IMPORT/EXPORT COMMANDS
-    # ============================================================================
+    # ── list-images ──
+    sub.add_parser("list-images", help="List local images")
 
-    # EXPORT-CONTAINER
+    # ── remove-image ──
+    sp = sub.add_parser("remove-image", help="Remove a local image")
+    sp.add_argument("image"); _type(sp)
+
+    # ── fix-x11 ──
+    sub.add_parser("fix-x11", help="Fix X11/XAUTH forwarding (Linux)")
+
+    # ── export-container / import-image (Linux) ──
     sp = sub.add_parser("export-container", help="Export container as tar.gz (Linux)")
-    _add_name_arg(sp)
-    sp.add_argument("path", help="Output path for tar.gz file")
-    _add_type_arg(sp)
+    _name(sp); sp.add_argument("path"); _type(sp)
 
-    # IMPORT-IMAGE
     sp = sub.add_parser("import-image", help="Import image from tar (Linux)")
-    sp.add_argument("tar", help="Path to tar file")
-    sp.add_argument("name", help="Name for imported image")
-    _add_type_arg(sp)
+    sp.add_argument("tar"); sp.add_argument("name"); _type(sp)
 
-    # EXPORT-STORAGE
-    sp = sub.add_parser("export-storage", help="Export Windows storage")
-    _add_name_arg(sp)
-    sp.add_argument("path", help="Output path")
-    _add_type_arg(sp)
+    # ── cleanup-golden ──
+    sp = sub.add_parser("cleanup-golden", help="Remove dangling golden images")
+    _type(sp)
 
-    # IMPORT-STORAGE
-    sp = sub.add_parser("import-storage", help="Import Windows storage")
-    sp.add_argument("path", help="Path to storage file")
-    sp.add_argument("name", help="Container name")
-    _add_type_arg(sp)
+    # ── restore (snapshot) ──
+    sp = sub.add_parser("restore", help="Restore from snapshot (Windows)")
+    _name(sp)
+    sp.add_argument("snapshot", nargs="?", default="", help="Snapshot name")
+    _type(sp)
 
-    # ============================================================================
-    # CONNECTIVITY COMMANDS
-    # ============================================================================
+    # ── export-storage / import-storage (Windows) ──
+    sp = sub.add_parser("export-storage", help="Export Windows storage (Windows)")
+    _name(sp); sp.add_argument("path"); _type(sp)
 
-    # RDP, WEB, VNC
-    for cmd, helptext in [
-        ("rdp", "Open RDP connection (Windows)"),
-        ("web", "Open web viewer (Windows)"),
-        ("vnc", "Open VNC connection (Windows)"),
-    ]:
-        sp = sub.add_parser(cmd, help=helptext)
-        _add_name_arg(sp)
-        _add_type_arg(sp)
+    sp = sub.add_parser("import-storage", help="Import Windows storage (Windows)")
+    sp.add_argument("path"); sp.add_argument("name"); _type(sp)
 
-    # ============================================================================
-    # LAB MANAGEMENT
-    # ============================================================================
+    # ── rdp / web / vnc (Windows) ──
+    for cmd, help_text in [("rdp", "Open RDP connection"),
+                            ("web", "Open web viewer"),
+                            ("vnc", "Open VNC connection")]:
+        sp = sub.add_parser(cmd, help=help_text); _name(sp); _type(sp)
 
-    lp = sub.add_parser("lab", help="Manage lab environments")
-    lsub = lp.add_subparsers(dest="lab_cmd", metavar="subcommand")
+    # ── adopt (Windows) ──
+    sp = sub.add_parser("adopt", help="Adopt existing Windows storage as golden")
+    sp.add_argument("path"); _type(sp)
 
-    # LAB CREATE
-    sp = lsub.add_parser("create", help="Create a lab from config")
-    sp.add_argument("name", help="Lab name")
-    sp.add_argument("--config", dest="configfile", default="",
-                   help="Path to lab JSON config file")
+    # ── convert-golden / golden-status (Windows) ──
+    for cmd, help_text in [("convert-golden", "Convert golden to QCOW2"),
+                            ("golden-status",  "Show golden storage status")]:
+        sp = sub.add_parser(cmd, help=help_text); _type(sp)
 
-    # LAB START, STOP, DELETE, STATUS
-    for lcmd, lhelp in [
-        ("start", "Start all containers in a lab"),
-        ("stop", "Stop all containers in a lab"),
-        ("delete", "Delete all containers in a lab"),
-        ("status", "Show status of lab containers"),
-    ]:
-        sp = lsub.add_parser(lcmd, help=lhelp)
-        sp.add_argument("name", help="Lab name")
+    # ── golden ──
+    sp = sub.add_parser("golden",
+                        help="Shell into golden container (Linux) or start it (Windows)")
+    _type(sp, required=True)
+    sp.add_argument("--version", default="", help="(Windows) OS version")
+    sp.add_argument("--ram",     default="", help="(Windows) RAM size")
+    sp.add_argument("--cpu",     default="", help="(Windows) CPU cores")
 
-    # LAB LIST
-    lsub.add_parser("list", help="List all labs")
+    # ── commit ──
+    sp = sub.add_parser("commit",
+                        help="Commit golden container to image (Linux) "
+                             "or save container storage as golden (Windows)")
+    sp.add_argument("name", nargs="?", default="",
+                    help="Container name (Windows: required)")
+    _type(sp, required=True)
 
-    # ============================================================================
-    # CONFIGURATION
-    # ============================================================================
+    # ── update-base ──
+    sp = sub.add_parser("update-base", help="Pull latest base image")
+    _type(sp, required=True)
 
+    # ── recreate-golden / restore-golden (Linux) ──
+    for cmd, help_text in [("recreate-golden", "Recreate golden from base (Linux)"),
+                            ("restore-golden",  "Restore golden from image (Linux)")]:
+        sp = sub.add_parser(cmd, help=help_text); _type(sp)
+
+    # ── batch ops ──
+    for cmd, help_text in [("clean",     "Remove stopped containers"),
+                            ("clean-all", "Remove all containers (except golden)"),
+                            ("stop-all",  "Stop all containers (except golden)")]:
+        sp = sub.add_parser(cmd, help=help_text); _type(sp)
+
+    # ── config ──
     cp = sub.add_parser("config", help="Manage labctl configuration")
-    csub = cp.add_subparsers(dest="config_cmd", metavar="subcommand")
-
-    # CONFIG SHOW
-    csub.add_parser("show", help="Show all configuration")
-
-    # CONFIG SET
-    sp = csub.add_parser("set", help="Set a configuration key")
-    sp.add_argument("key", help="Config key (e.g., linux.baseimage)")
-    sp.add_argument("value", help="Config value")
-
-    # CONFIG RESET
+    csub = cp.add_subparsers(dest="config_cmd", metavar="<subcommand>")
+    csub.add_parser("show",  help="Show all config")
+    sp = csub.add_parser("set", help="Set a config key")
+    sp.add_argument("key"); sp.add_argument("value")
     csub.add_parser("reset", help="Reset config to defaults")
 
-    # ============================================================================
-    # UTILITIES
-    # ============================================================================
+    # ── lab ──
+    lp = sub.add_parser("lab", help="Manage lab environments")
+    lsub = lp.add_subparsers(dest="lab_cmd", metavar="<subcommand>")
+    sp = lsub.add_parser("create", help="Create a lab")
+    sp.add_argument("name")
+    sp.add_argument("--config", dest="config_file", default="",
+                    help="Path to lab JSON config file")
+    for lcmd, lhelp in [("start",  "Start all containers in a lab"),
+                         ("stop",   "Stop all containers in a lab"),
+                         ("delete", "Delete all containers in a lab"),
+                         ("status", "Show status of lab containers")]:
+        sp = lsub.add_parser(lcmd, help=lhelp)
+        sp.add_argument("name")
+    lsub.add_parser("list", help="List all labs")
 
-    # UPDATE-BASE
-    sp = sub.add_parser("update-base", help="Pull latest base image")
-    _add_type_arg(sp, required=True)
-
-    # REMOVE-IMAGE
-    sp = sub.add_parser("remove-image", help="Remove a local image")
-    sp.add_argument("image", help="Image name")
-    _add_type_arg(sp)
-
-    # VERSION, HELP
+    # ── version / help ──
     sub.add_parser("version", help="Show version")
-    sub.add_parser("help", help="Show help")
+    sub.add_parser("help",    help="Show help")
 
     return p
 
 
-def _add_name_arg(sp):
-    """Add the 'name' positional argument."""
-    sp.add_argument("name", help="Container name")
-
-
-def _add_type_arg(sp, required=False):
-    """Add the --type argument."""
-    sp.add_argument("--type", choices=["linux", "windows"], required=required,
-                   help="Container type (auto-detected from registry if omitted)")
-
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Main dispatch
+# ══════════════════════════════════════════════════════════════════════════════
 def main():
     parser = _build_parser()
     args = parser.parse_args()
@@ -2438,16 +2384,50 @@ def main():
             error(f"Command '{cmd}' is Windows-only but container is type '{ctype}'")
         return win
 
-    def _auto(container_name: str = ""):
-        """Return (mgr, resolved_type) auto-detecting from registry."""
-        ct = ctype
-        if not ct and container_name:
-            ct = cfg.get_type(container_name)
+    def _guess_type_from_podman(name: str) -> Optional[str]:
+        img = pod.get_image_ref(name).strip().lower()
+        if not img:
+            return None
+        if "dockurr" in img or "windows" in img:
+            return "windows"
+        if "kali" in img:
+            return "linux"
+        return None
+
+    def _pick_container(ref: str) -> str:
+        matches = pod.resolve_ref(ref)
+        if not matches:
+            error(f"Container '{ref}' not found (name/ID/prefix).")
+        if len(matches) == 1:
+            return matches[0]
+
+        # Ambiguous: ask user
+        print(f"Multiple containers match '{ref}':")
+        for i, n in enumerate(matches, 1):
+            t = cfg.get_type(n) or _guess_type_from_podman(n) or "unknown"
+            print(f"  {i}) {n} ({t})")
+        while True:
+            sel = input(f"Select 1-{len(matches)} (or blank to abort): ").strip()
+            if not sel:
+                error("Aborted.")
+            if sel.isdigit():
+                k = int(sel)
+                if 1 <= k <= len(matches):
+                    return matches[k - 1]
+
+    def _auto(container_ref: str = ""):
+        """Return (mgr, resolved_type) auto-detecting from registry/podman."""
+        name = _pick_container(container_ref) if container_ref else ""
+        ct = ctype or (cfg.get_type(name) if name else None)
+        if not ct and name:
+            ct = _guess_type_from_podman(name)
+
         if ct == "linux":
             return linux, "linux"
         if ct == "windows":
             return win, "windows"
-        error(f"Cannot determine container type for '{container_name}'. "
+
+        error(f"Cannot determine container type for '{container_ref}'. "
               "Pass --type linux|windows")
 
     # ── command dispatch ─────────────────────────────────────────────────────
@@ -2457,7 +2437,7 @@ def main():
         else:
             win.create(args.name,
                        version=args.version, ram=args.ram, cpu=args.cpu,
-                       disk=args.disk, user=args.user,fresh=args.fresh, full_copy=args.fullcopy, password=args.password)
+                       disk=args.disk, user=args.user,fresh=args.fresh, full_copy=args.full_copy)
 
     elif cmd == "start":
         mgr, _ = _auto(args.name)
@@ -2672,6 +2652,63 @@ def main():
 
     else:
         parser.print_help()
+
+
+def auto_resolve_type(cfg, linux_mgr, win_mgr, pod, name):
+    """
+    Auto-resolve container type from name.
+    
+    Strategy:
+    1. Check registry first (cfg.gettype) - most reliable
+    2. If not registered, check if container exists and use heuristics
+       via filternamesbytype() on both managers
+    3. If found in exactly one manager, use that type
+    4. If ambiguous or not found, return None
+    
+    Args:
+        cfg: Config instance
+        linux_mgr: LinuxManager instance
+        win_mgr: WindowsManager instance
+        pod: Podman instance
+        name: Container name to resolve
+    
+    Returns:
+        tuple (manager, type_str) or (None, None) if cannot resolve
+    
+    Example:
+        mgr, ctype = auto_resolve_type(cfg, linux, win, pod, 'Development')
+        if mgr is None:
+            error(f"Cannot determine type for '{name}'. Pass --type")
+        mgr.start(name)
+    """
+    # First try: check registry (registered containers)
+    reg_type = cfg.gettype(name)
+    if reg_type == 'linux':
+        return (linux_mgr, 'linux')
+    elif reg_type == 'windows':
+        return (win_mgr, 'windows')
+    
+    # Second try: check if container exists and use heuristics
+    if pod.container_exists(name):
+        all_names = [name]
+        
+        # Check both managers using their heuristics
+        # (image name patterns, golden container names, etc.)
+        linux_matches = linux_mgr.filternamesbytype(all_names)
+        windows_matches = win_mgr.filternamesbytype(all_names)
+        
+        # If only one manager claims it, use that
+        if linux_matches and not windows_matches:
+            return (linux_mgr, 'linux')
+        elif windows_matches and not linux_matches:
+            return (win_mgr, 'windows')
+        elif linux_matches and windows_matches:
+            # Both claim it - ambiguous (shouldn't happen in practice)
+            # Return None to force user to specify
+            pass
+    
+    # Cannot resolve (ambiguous, doesn't exist, or unrecognized)
+    return (None, None)
 
 
 if __name__ == "__main__":
