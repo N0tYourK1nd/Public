@@ -94,8 +94,8 @@ DEFAULTS: dict = {
     },
     "network": {
         "name":    "lab-net",
-        "subnet":  "10.89.0.0/24",
-        "gateway": "10.89.0.1",
+        "subnet":  "10.88.0.0/24",
+        "gateway": "10.88.0.1",
     },
     "shared_dir": str(SHARED_DIR),
 }
@@ -109,9 +109,11 @@ class Config:
         self._cfg_f  = LABCTL_DIR / "config.json"
         self._reg_f  = LABCTL_DIR / "containers.json"
         self._port_f = LABCTL_DIR / "ports.json"
+        self._fwd_f  = LABCTL_DIR / "forwards.json"
         self._cfg  = self._load(self._cfg_f,  {})
         self._reg  = self._load(self._reg_f,  {})
         self._port = self._load(self._port_f, {})
+        self._fwd  = self._load(self._fwd_f,  {})
 
     # ── internal ──
     @staticmethod
@@ -264,6 +266,26 @@ class Config:
             if w not in used_web and w not in listening and r not in listening:
                 return w, r
         raise RuntimeError("No available ports in range 8006-8106")
+
+    # ── port forward tracking ──
+    def get_forwards(self) -> dict:
+        return dict(self._fwd)
+
+    def add_forward(self, rule_id: str, container: str, host_port: int,
+                    container_port: int, proto: str, ip: str):
+        self._fwd[rule_id] = {
+            "container":      container,
+            "host_port":      host_port,
+            "container_port": container_port,
+            "proto":          proto,
+            "ip":             ip,
+            "created":        datetime.now().isoformat(),
+        }
+        self._save(self._fwd_f, self._fwd)
+
+    def remove_forward(self, rule_id: str):
+        self._fwd.pop(rule_id, None)
+        self._save(self._fwd_f, self._fwd)
 
     @staticmethod
     def _listening_ports() -> set:
@@ -444,11 +466,11 @@ class NetworkManager:
 
     @property
     def subnet(self) -> str:
-        return self.cfg.get("network.subnet", "10.89.0.0/24")
+        return self.cfg.get("network.subnet", "10.88.0.0/24")
 
     @property
     def gateway(self) -> str:
-        return self.cfg.get("network.gateway", "10.89.0.1")
+        return self.cfg.get("network.gateway", "10.88.0.1")
 
     def ensure(self):
         if not self.podman.network_exists(self.name):
@@ -462,13 +484,127 @@ class NetworkManager:
             success(f"Network '{self.name}' created")
 
     def allocate_ip(self) -> str:
-        prefix = self.subnet.rsplit(".", 1)[0]   # e.g. "10.89.0"
+        prefix = self.subnet.rsplit(".", 1)[0]   # e.g. "10.88.0"
+        # Collect IPs from live containers
         used = set(self.podman.get_used_ips(prefix + "."))
+        # Also include IPs of stopped containers stored in the registry
+        # so we never recycle an IP that belongs to a registered container
+        for entry in self.cfg.get_registry().values():
+            ip = entry.get("ip", "")
+            if ip.startswith(prefix + "."):
+                used.add(ip)
+        # .1 is the host/gateway; guests start at .2 and increment
         for oct in range(2, 255):
             candidate = f"{prefix}.{oct}"
-            if candidate not in used and candidate != self.gateway:
+            if candidate not in used:
                 return candidate
         raise RuntimeError(f"No available IPs in {self.subnet}")
+
+
+# ── ForwardManager ─────────────────────────────────────────────────────────────
+class ForwardManager:
+    """Manage temporary host→container port forwards via iptables DNAT."""
+
+    def __init__(self, cfg: Config, pod: Podman, dry_run=False, verbose=False):
+        self.cfg      = cfg
+        self.pod      = pod
+        self.dry_run  = dry_run
+        self.verbose  = verbose
+
+    def _sys(self, args: list, check=True, capture=False):
+        return _run_sys(args, check=check, capture=capture,
+                        dry_run=self.dry_run, verbose=self.verbose)
+
+    def _container_ip(self, name: str) -> str:
+        """Return the container IP, preferring the registry over live inspect."""
+        entry = self.cfg.get_registry().get(name, {})
+        ip = entry.get("ip", "")
+        if not ip:
+            ip = self.pod.get_ip(name)
+        return ip
+
+    def _iptables_nat(self, action: str, proto: str,
+                      host_port: int, ip: str, ctr_port: int):
+        self._sys(["sudo", "iptables", "-t", "nat", action, "PREROUTING",
+                   "-p", proto, "--dport", str(host_port),
+                   "-j", "DNAT", "--to-destination", f"{ip}:{ctr_port}"],
+                  check=(action == "-A"))
+
+    def _iptables_fwd(self, action: str, proto: str, ip: str, ctr_port: int):
+        self._sys(["sudo", "iptables", action, "FORWARD",
+                   "-p", proto, "-d", ip, "--dport", str(ctr_port),
+                   "-j", "ACCEPT"],
+                  check=(action == "-A"))
+
+    def add(self, container: str, spec: str):
+        """Add a forward.  spec = host_port:container_port[/tcp|udp]"""
+        proto = "tcp"
+        if "/" in spec:
+            spec, proto = spec.rsplit("/", 1)
+            proto = proto.lower()
+        if proto not in ("tcp", "udp"):
+            error("Protocol must be tcp or udp")
+        parts = spec.split(":")
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            error("Format: host_port:container_port[/tcp|udp]")
+        host_port, ctr_port = int(parts[0]), int(parts[1])
+
+        ip = self._container_ip(container)
+        if not ip:
+            error(f"Cannot resolve IP for '{container}'. "
+                  "Is it running (or registered with an IP)?")
+
+        rule_id = f"{container}:{host_port}:{ctr_port}/{proto}"
+        if rule_id in self.cfg.get_forwards():
+            warn(f"Forward already exists: {rule_id}")
+            return
+
+        self._iptables_nat("-A", proto, host_port, ip, ctr_port)
+        self._iptables_fwd("-A", proto, ip, ctr_port)
+        self.cfg.add_forward(rule_id, container, host_port, ctr_port, proto, ip)
+        success(f"Forward added: host:{host_port} → {container} ({ip}):{ctr_port}/{proto}")
+
+    def list(self):
+        forwards = self.cfg.get_forwards()
+        if not forwards:
+            print("No active port forwards.")
+            return
+        header("Active port forwards:")
+        fmt = "  {:<22} {:>6}  →  {:<15} {:>6}  {}"
+        print(fmt.format("Container", "Host", "Container IP", "Port", "Proto"))
+        print("  " + "-" * 60)
+        for r in forwards.values():
+            print(fmt.format(
+                r["container"], r["host_port"],
+                r["ip"], r["container_port"], r["proto"],
+            ))
+
+    def remove(self, container: str, host_port: int):
+        """Remove all forwards for container:host_port."""
+        forwards = self.cfg.get_forwards()
+        targets = {rid: r for rid, r in forwards.items()
+                   if r["container"] == container and r["host_port"] == host_port}
+        if not targets:
+            error(f"No forward found for {container} host_port={host_port}")
+        for rule_id, r in targets.items():
+            self._iptables_nat("-D", r["proto"], r["host_port"], r["ip"], r["container_port"])
+            self._iptables_fwd("-D", r["proto"], r["ip"], r["container_port"])
+            self.cfg.remove_forward(rule_id)
+            success(f"Removed: host:{r['host_port']} → {container}:{r['container_port']}/{r['proto']}")
+
+    def flush(self, container: str = ""):
+        """Remove all forwards, or all forwards for one container."""
+        forwards = self.cfg.get_forwards()
+        targets = ({rid: r for rid, r in forwards.items() if r["container"] == container}
+                   if container else dict(forwards))
+        if not targets:
+            print("Nothing to flush.")
+            return
+        for rule_id, r in targets.items():
+            self._iptables_nat("-D", r["proto"], r["host_port"], r["ip"], r["container_port"])
+            self._iptables_fwd("-D", r["proto"], r["ip"], r["container_port"])
+            self.cfg.remove_forward(rule_id)
+            success(f"Removed: host:{r['host_port']} → {r['container']}:{r['container_port']}/{r['proto']}")
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -2107,11 +2243,106 @@ class LabManager:
 # ══════════════════════════════════════════════════════════════════════════════
 # CLI – argument parser
 # ══════════════════════════════════════════════════════════════════════════════
+class _GroupedHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Hides the flat subcommand listing so the grouped epilog takes its place."""
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            return ""
+        return super()._format_action(action)
+
+
 def _build_parser() -> argparse.ArgumentParser:
+    _S = argparse.SUPPRESS   # suppress from auto-list; grouped epilog replaces it
+
+    _EPILOG = """\
+Commands:
+
+  Lifecycle
+    create              Create a new container  (--type linux|windows required)
+    start               Start a stopped container
+    stop                Stop a running container
+    restart             Restart a container
+    delete              Stop and remove a container
+
+  Interaction
+    connect             Interactive shell (Linux: tmux) or RDP launch (Windows)
+    exec                Run a command inside a Linux container
+    logs                Show container logs
+    inspect             Show full container details
+    stats               Show resource usage  [name]
+
+  Container Management
+    list                List containers  [--running|--stopped]  [--type]
+    clone               Clone a container  source target
+    rename              Rename a container  old new
+    clean               Remove all stopped containers
+    clean-all           Remove all containers except golden
+    stop-all            Stop all running containers except golden
+    list-images         List locally cached images
+    remove-image        Remove a local image  image
+
+  Networking & Port Forwards
+    forward add         Add a host→container forward  name host:ctr[/tcp|udp]
+    forward list        Show all active port forwards
+    forward remove      Remove a forward by host port  name host_port
+    forward flush       Remove all forwards  [name]
+
+  Linux (Kali)
+    pause               Pause a container
+    unpause             Unpause a paused container
+    mount               Mount container filesystem to host
+    umount              Unmount container filesystem
+    fix-x11             Fix X11/XAUTH display forwarding
+    export-container    Export container as tar.gz  name path
+    import-image        Import a container image from tar  tar name
+    cleanup-golden      Remove dangling golden images
+    recreate-golden     Recreate golden container from base image
+    restore-golden      Restore golden container from saved image
+
+  Windows
+    force-stop          Force-stop a hung container
+    ports               Show web/RDP port mappings
+    rdp                 Open an RDP client session
+    web                 Open the web viewer  (port 8006+)
+    vnc                 Open a VNC client session
+    snapshot            Create a storage snapshot
+    list-snapshots      List available snapshots
+    restore             Restore from a snapshot  name [snapshot]
+    export-storage      Export Windows storage directory  name path
+    import-storage      Import a Windows storage directory  path name
+    adopt               Adopt an existing storage dir as the golden  path
+    convert-golden      Convert golden disk image to QCOW2
+    golden-status       Show golden storage status
+
+  Golden Images
+    golden              Shell into (Linux) or start (Windows) golden container
+    commit              Save golden container/storage as the new golden image
+    update-base         Pull the latest base image
+
+  Labs
+    lab create          Create a lab from a JSON config file  name [--config]
+    lab start           Start all containers in a lab  name
+    lab stop            Stop all containers in a lab  name
+    lab delete          Delete all containers in a lab  name
+    lab status          Show container statuses for a lab  name
+    lab list            List all saved labs
+
+  Configuration
+    config show         Show merged configuration
+    config set          Set a config value  key value  (e.g. windows.default_ram 8G)
+    config reset        Reset all configuration to defaults
+
+  System
+    version             Show labctl version
+    help                Show this help
+
+Use 'labctl <command> --help' for per-command options and arguments."""
+
     p = argparse.ArgumentParser(
         prog="labctl",
         description="Unified lab container management (Linux + Windows via Podman)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_GroupedHelpFormatter,
+        epilog=_EPILOG,
     )
     p.add_argument("--dry-run", action="store_true",
                    help="Print commands without executing")
@@ -2128,8 +2359,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=None,
                         help="Container type (auto-detected from registry if omitted)")
 
-    # ── create ──
-    c = sub.add_parser("create", help="Create a container")
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+    c = sub.add_parser("create", help=_S,
+                       description="Create a new container from the golden image.")
     _name(c); _type(c, required=True)
     c.add_argument("--version",   default="", help="(Windows) OS version")
     c.add_argument("--ram",       default="", help="(Windows) RAM size, e.g. 4G")
@@ -2139,166 +2371,168 @@ def _build_parser() -> argparse.ArgumentParser:
     c.add_argument("--pass",      dest="password", default="",
                    help="(Windows) password")
     c.add_argument("--fresh",     action="store_true",
-                   help="(Windows) skip golden, fresh install")
+                   help="(Windows) skip golden image, do a fresh OS install")
     c.add_argument("--full-copy", dest="full_copy", action="store_true",
-                   help="(Windows) full copy instead of CoW")
+                   help="(Windows) full disk copy instead of CoW clone")
 
-    # ── universal single-container commands ──
-    for cmd, help_text in [
-        ("start",   "Start a stopped container"),
-        ("stop",    "Stop a running container"),
-        ("restart", "Restart a container"),
-        ("delete",  "Stop and remove a container"),
-        ("connect", "Connect interactively to a container"),
-        ("inspect", "Show detailed container info"),
-        ("logs",    "Show container logs"),
-        ("pause",   "Pause a container (Linux)"),
-        ("unpause", "Unpause a container (Linux)"),
-        ("mount",   "Mount container filesystem (Linux)"),
-        ("umount",  "Unmount container filesystem (Linux)"),
-        ("force-stop", "Force stop a container (Windows)"),
-        ("ports",   "Show port mappings (Windows)"),
-        ("snapshot","Create a snapshot (Windows)"),
-        ("list-snapshots", "List snapshots (Windows)"),
-    ]:
-        sp = sub.add_parser(cmd, help=help_text)
-        _name(sp); _type(sp)
+    for cmd in ("start", "stop", "restart", "delete"):
+        sp = sub.add_parser(cmd, help=_S); _name(sp); _type(sp)
 
-    # ── exec ──
-    sp = sub.add_parser("exec", help="Execute command in container (Linux)")
+    # ── Interaction ────────────────────────────────────────────────────────────
+    for cmd in ("connect", "inspect", "logs"):
+        sp = sub.add_parser(cmd, help=_S); _name(sp); _type(sp)
+
+    sp = sub.add_parser("exec", help=_S,
+                        description="Execute a command inside a Linux container.")
     _name(sp); _type(sp)
     sp.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to execute")
 
-    # ── stats ──
-    sp = sub.add_parser("stats", help="Show resource usage")
+    sp = sub.add_parser("stats", help=_S,
+                        description="Show resource usage. Omit name to show all containers.")
     sp.add_argument("name", nargs="?", default="", help="Container name (optional)")
     _type(sp)
 
-    # ── clone ──
-    sp = sub.add_parser("clone", help="Clone a container")
-    sp.add_argument("source"); sp.add_argument("target"); _type(sp)
-
-    # ── rename ──
-    sp = sub.add_parser("rename", help="Rename a container")
-    sp.add_argument("old"); sp.add_argument("new"); _type(sp)
-
-    # ── list ──
-    sp = sub.add_parser("list", help="List containers")
+    # ── Container Management ───────────────────────────────────────────────────
+    sp = sub.add_parser("list", help=_S,
+                        description="List containers. Filter by state or type.")
     _type(sp)
-    sp.add_argument("--running", action="store_true", help="Only running")
-    sp.add_argument("--stopped", action="store_true", help="Only stopped")
+    sp.add_argument("--running", action="store_true", help="Show only running containers")
+    sp.add_argument("--stopped", action="store_true", help="Show only stopped containers")
 
-    # ── list-running / list-stopped (legacy compat) ──
-    for cmd, help_text in [("list-running",  "List running containers"),
-                            ("list-stopped",  "List stopped containers")]:
-        sp = sub.add_parser(cmd, help=help_text); _type(sp)
+    for cmd in ("list-running", "list-stopped"):   # legacy compat
+        sp = sub.add_parser(cmd, help=_S); _type(sp)
 
-    # ── list-images ──
-    sub.add_parser("list-images", help="List local images")
+    sub.add_parser("list-images", help=_S)
 
-    # ── remove-image ──
-    sp = sub.add_parser("remove-image", help="Remove a local image")
+    sp = sub.add_parser("remove-image", help=_S)
     sp.add_argument("image"); _type(sp)
 
-    # ── fix-x11 ──
-    sub.add_parser("fix-x11", help="Fix X11/XAUTH forwarding (Linux)")
+    sp = sub.add_parser("clone", help=_S,
+                        description="Clone a container (Linux or Windows).")
+    sp.add_argument("source"); sp.add_argument("target"); _type(sp)
 
-    # ── export-container / import-image (Linux) ──
-    sp = sub.add_parser("export-container", help="Export container as tar.gz (Linux)")
+    sp = sub.add_parser("rename", help=_S)
+    sp.add_argument("old"); sp.add_argument("new"); _type(sp)
+
+    for cmd in ("clean", "clean-all", "stop-all"):
+        sp = sub.add_parser(cmd, help=_S); _type(sp)
+
+    # ── Linux (Kali) ───────────────────────────────────────────────────────────
+    for cmd in ("pause", "unpause", "mount", "umount"):
+        sp = sub.add_parser(cmd, help=_S); _name(sp); _type(sp)
+
+    sub.add_parser("fix-x11", help=_S)
+
+    sp = sub.add_parser("export-container", help=_S,
+                        description="Export a Linux container as a tar.gz archive.")
     _name(sp); sp.add_argument("path"); _type(sp)
 
-    sp = sub.add_parser("import-image", help="Import image from tar (Linux)")
+    sp = sub.add_parser("import-image", help=_S,
+                        description="Import a container image from a tar archive.")
     sp.add_argument("tar"); sp.add_argument("name"); _type(sp)
 
-    # ── cleanup-golden ──
-    sp = sub.add_parser("cleanup-golden", help="Remove dangling golden images")
-    _type(sp)
+    for cmd in ("cleanup-golden", "recreate-golden", "restore-golden"):
+        sp = sub.add_parser(cmd, help=_S); _type(sp)
 
-    # ── restore (snapshot) ──
-    sp = sub.add_parser("restore", help="Restore from snapshot (Windows)")
+    # ── Windows ────────────────────────────────────────────────────────────────
+    for cmd in ("force-stop", "ports", "snapshot", "list-snapshots",
+                "rdp", "web", "vnc"):
+        sp = sub.add_parser(cmd, help=_S); _name(sp); _type(sp)
+
+    sp = sub.add_parser("restore", help=_S,
+                        description="Restore a Windows container from a snapshot.")
     _name(sp)
-    sp.add_argument("snapshot", nargs="?", default="", help="Snapshot name")
+    sp.add_argument("snapshot", nargs="?", default="", help="Snapshot name (omit for latest)")
     _type(sp)
 
-    # ── export-storage / import-storage (Windows) ──
-    sp = sub.add_parser("export-storage", help="Export Windows storage (Windows)")
+    sp = sub.add_parser("export-storage", help=_S,
+                        description="Export a Windows container storage directory.")
     _name(sp); sp.add_argument("path"); _type(sp)
 
-    sp = sub.add_parser("import-storage", help="Import Windows storage (Windows)")
+    sp = sub.add_parser("import-storage", help=_S,
+                        description="Import a Windows storage directory as a container.")
     sp.add_argument("path"); sp.add_argument("name"); _type(sp)
 
-    # ── rdp / web / vnc (Windows) ──
-    for cmd, help_text in [("rdp", "Open RDP connection"),
-                            ("web", "Open web viewer"),
-                            ("vnc", "Open VNC connection")]:
-        sp = sub.add_parser(cmd, help=help_text); _name(sp); _type(sp)
-
-    # ── adopt (Windows) ──
-    sp = sub.add_parser("adopt", help="Adopt existing Windows storage as golden")
+    sp = sub.add_parser("adopt", help=_S,
+                        description="Adopt an existing storage directory as the Windows golden image.")
     sp.add_argument("path"); _type(sp)
 
-    # ── convert-golden / golden-status (Windows) ──
-    for cmd, help_text in [("convert-golden", "Convert golden to QCOW2"),
-                            ("golden-status",  "Show golden storage status")]:
-        sp = sub.add_parser(cmd, help=help_text); _type(sp)
+    for cmd in ("convert-golden", "golden-status"):
+        sp = sub.add_parser(cmd, help=_S); _type(sp)
 
-    # ── golden ──
-    sp = sub.add_parser("golden",
-                        help="Shell into golden container (Linux) or start it (Windows)")
+    # ── Golden Images ──────────────────────────────────────────────────────────
+    sp = sub.add_parser("golden", help=_S,
+                        description="Shell into the Linux golden container, "
+                                    "or start the Windows golden container.")
     _type(sp, required=True)
     sp.add_argument("--version", default="", help="(Windows) OS version")
     sp.add_argument("--ram",     default="", help="(Windows) RAM size")
     sp.add_argument("--cpu",     default="", help="(Windows) CPU cores")
 
-    # ── commit ──
-    sp = sub.add_parser("commit",
-                        help="Commit golden container to image (Linux) "
-                             "or save container storage as golden (Windows)")
+    sp = sub.add_parser("commit", help=_S,
+                        description="Linux: commit golden container to a saved image. "
+                                    "Windows: save container storage as the new golden.")
     sp.add_argument("name", nargs="?", default="",
-                    help="Container name (Windows: required)")
+                    help="Container name (required for Windows)")
     _type(sp, required=True)
 
-    # ── update-base ──
-    sp = sub.add_parser("update-base", help="Pull latest base image")
+    sp = sub.add_parser("update-base", help=_S,
+                        description="Pull the latest base image for the given type.")
     _type(sp, required=True)
 
-    # ── recreate-golden / restore-golden (Linux) ──
-    for cmd, help_text in [("recreate-golden", "Recreate golden from base (Linux)"),
-                            ("restore-golden",  "Restore golden from image (Linux)")]:
-        sp = sub.add_parser(cmd, help=help_text); _type(sp)
-
-    # ── batch ops ──
-    for cmd, help_text in [("clean",     "Remove stopped containers"),
-                            ("clean-all", "Remove all containers (except golden)"),
-                            ("stop-all",  "Stop all containers (except golden)")]:
-        sp = sub.add_parser(cmd, help=help_text); _type(sp)
-
-    # ── config ──
-    cp = sub.add_parser("config", help="Manage labctl configuration")
-    csub = cp.add_subparsers(dest="config_cmd", metavar="<subcommand>")
-    csub.add_parser("show",  help="Show all config")
-    sp = csub.add_parser("set", help="Set a config key")
-    sp.add_argument("key"); sp.add_argument("value")
-    csub.add_parser("reset", help="Reset config to defaults")
-
-    # ── lab ──
-    lp = sub.add_parser("lab", help="Manage lab environments")
+    # ── Labs ───────────────────────────────────────────────────────────────────
+    lp = sub.add_parser("lab", help=_S,
+                        description="Manage lab environments (named groups of containers).")
     lsub = lp.add_subparsers(dest="lab_cmd", metavar="<subcommand>")
-    sp = lsub.add_parser("create", help="Create a lab")
+    sp = lsub.add_parser("create", help="Create a lab from a JSON config file")
     sp.add_argument("name")
     sp.add_argument("--config", dest="config_file", default="",
                     help="Path to lab JSON config file")
-    for lcmd, lhelp in [("start",  "Start all containers in a lab"),
-                         ("stop",   "Stop all containers in a lab"),
-                         ("delete", "Delete all containers in a lab"),
-                         ("status", "Show status of lab containers")]:
+    for lcmd, lhelp in [("start",  "Start all containers in the lab"),
+                         ("stop",   "Stop all containers in the lab"),
+                         ("delete", "Delete all containers in the lab"),
+                         ("status", "Show container statuses for the lab")]:
         sp = lsub.add_parser(lcmd, help=lhelp)
         sp.add_argument("name")
-    lsub.add_parser("list", help="List all labs")
+    lsub.add_parser("list", help="List all saved labs")
 
-    # ── version / help ──
-    sub.add_parser("version", help="Show version")
-    sub.add_parser("help",    help="Show help")
+    # ── Networking & Port Forwards ─────────────────────────────────────────────
+    fp = sub.add_parser("forward", help=_S,
+                        description="Manage host→container port forwards via iptables DNAT.\n"
+                                    "Rules require sudo and are not persistent across reboots.\n"
+                                    "Run 'forward flush' before rebooting for a clean teardown.")
+    fsub = fp.add_subparsers(dest="fwd_cmd", metavar="<subcommand>")
+
+    sp = fsub.add_parser("add",
+                         help="Add a forward  name host:ctr[/tcp|udp]")
+    sp.add_argument("name", help="Container name")
+    sp.add_argument("spec", help="host_port:container_port[/tcp|udp]  e.g. 8080:80/tcp")
+
+    sp = fsub.add_parser("remove",
+                         help="Remove a forward by container and host port")
+    sp.add_argument("name", help="Container name")
+    sp.add_argument("host_port", type=int, help="Host port to remove")
+
+    fsub.add_parser("list", help="List all active port forwards")
+
+    sp = fsub.add_parser("flush",
+                         help="Remove all forwards, or all for one container")
+    sp.add_argument("name", nargs="?", default="",
+                    help="Container name (omit to flush all)")
+
+    # ── Configuration ──────────────────────────────────────────────────────────
+    cp = sub.add_parser("config", help=_S,
+                        description="Manage labctl configuration (stored in ~/.labctl/config.json).")
+    csub = cp.add_subparsers(dest="config_cmd", metavar="<subcommand>")
+    csub.add_parser("show",  help="Show merged configuration (defaults + overrides)")
+    sp = csub.add_parser("set",
+                         help="Set a config key  (e.g. windows.default_ram 8G)")
+    sp.add_argument("key"); sp.add_argument("value")
+    csub.add_parser("reset", help="Reset all configuration to built-in defaults")
+
+    # ── System ─────────────────────────────────────────────────────────────────
+    sub.add_parser("version", help=_S)
+    sub.add_parser("help",    help=_S)
 
     return p
 
@@ -2326,6 +2560,7 @@ def main():
     linux = LinuxManager(cfg, pod, net, dry_run=dry, verbose=verb)
     win   = WindowsManager(cfg, pod, net, dry_run=dry, verbose=verb)
     lab   = LabManager(cfg, pod, net, linux, win, dry_run=dry, verbose=verb)
+    fwd   = ForwardManager(cfg, pod, dry_run=dry, verbose=verb)
 
     cmd = args.command
 
@@ -2650,6 +2885,20 @@ def main():
         else:
             linux.stop_all(); win.stop_all()
 
+    # ── Port forward management ───────────────────────────────────────────────
+    elif cmd == "forward":
+        fc = getattr(args, "fwd_cmd", None)
+        if fc == "add":
+            fwd.add(args.name, args.spec)
+        elif fc == "remove":
+            fwd.remove(args.name, args.host_port)
+        elif fc == "list":
+            fwd.list()
+        elif fc == "flush":
+            fwd.flush(getattr(args, "name", ""))
+        else:
+            parser.parse_args(["forward", "--help"])
+
     else:
         parser.print_help()
 
@@ -2713,3 +2962,4 @@ def auto_resolve_type(cfg, linux_mgr, win_mgr, pod, name):
 
 if __name__ == "__main__":
     main()
+
